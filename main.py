@@ -1,3 +1,4 @@
+import html
 import os
 import re
 import time
@@ -6,6 +7,11 @@ import requests
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 import xml.etree.ElementTree as ET
+
+
+def he(s: object) -> str:
+    """Escape HTML special characters (&, <, >) in dynamic string values."""
+    return html.escape(str(s))
 
 logging.basicConfig(
     level=logging.INFO,
@@ -208,14 +214,14 @@ def parse_form4(xml_text: str) -> list[dict]:
 
 def format_message(purchases: list[dict], date_str: str) -> str:
     lines = [
-        f'<b>🔍 SEC Form 4 Insider Purchases — {date_str}</b>',
+        f'<b>🔍 SEC Form 4 Insider Purchases — {he(date_str)}</b>',
         f'<i>{len(purchases)} qualifying purchase(s) above $100K — ranked by value</i>\n',
     ]
     for i, p in enumerate(purchases, 1):
         pos = '🆕 New position' if p['is_new'] else '➕ Added to position'
         lines.append(
-            f'<b>{i}. ${p["ticker"]}</b> — {p["company"]}\n'
-            f'   👤 {p["owner"]} | {p["title"]}\n'
+            f'<b>{i}. ${he(p["ticker"])}</b> — {he(p["company"])}\n'
+            f'   👤 {he(p["owner"])} | {he(p["title"])}\n'
             f'   💰 ${p["value"]:,.0f}  ({p["shares"]:,.0f} sh @ ${p["price"]:.2f})\n'
             f'   {pos}\n'
         )
@@ -258,7 +264,7 @@ def run_scanner() -> None:
     if not unique:
         send_telegram(
             '📋 <b>SEC Form 4 Insider Scanner</b>\n'
-            f'No qualifying insider purchases (> $100K) found for {end}.'
+            f'No qualifying insider purchases (&gt; $100K) found for {he(end)}.'
         )
     else:
         send_telegram(format_message(unique[:20], end))
