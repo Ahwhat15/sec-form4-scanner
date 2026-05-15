@@ -1,293 +1,274 @@
-import html
+"""
+SEC Form 4 Insider Purchase Scanner
+Railway deployment — runs daily at 06:00 CET
+Scans EDGAR for open-market insider purchases > $100k in last 24h
+Sends ranked Telegram alert
+"""
+
 import os
-import re
 import time
 import logging
-import requests
-from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
+import datetime
 import xml.etree.ElementTree as ET
+from zoneinfo import ZoneInfo
 
+import requests
+import schedule
 
-def he(s: object) -> str:
-    """Escape HTML special characters (&, <, >) in dynamic string values."""
-    return html.escape(str(s))
+# ── Config ────────────────────────────────────────────────────────────────────
+TELEGRAM_TOKEN  = os.environ["TELEGRAM_TOKEN"]
+TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
+MIN_VALUE       = int(os.getenv("MIN_VALUE", "100000"))
+MAX_RESULTS     = int(os.getenv("MAX_RESULTS", "20"))
+SCAN_HOUR_CET   = int(os.getenv("SCAN_HOUR_CET", "6"))
+REQUEST_TIMEOUT = 20
+CET             = ZoneInfo("Europe/Oslo")
+
+HEADERS = {"User-Agent": "VMc1Investments admin@vmc1.com", "Accept-Encoding": "gzip, deflate"}
 
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s %(levelname)s %(message)s'
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
 )
-logger = logging.getLogger(__name__)
+log = logging.getLogger(__name__)
 
-TELEGRAM_TOKEN   = os.environ['TELEGRAM_TOKEN']
-TELEGRAM_CHAT_ID = os.environ['TELEGRAM_CHAT_ID']
-
-HEADERS  = {'User-Agent': 'SEC-Form4-Scanner Ahwhat15 ahwhat15@gmail.com'}
-EFTS_URL = 'https://efts.sec.gov/LATEST/search-index'
-EDGAR    = 'https://www.sec.gov'
-MIN_VAL  = 100_000
-CET      = ZoneInfo('Europe/Paris')
-
-
-# ── Telegram ──────────────────────────────────────────────────────────────────
-
-def _send(text: str) -> None:
-    url = f'https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage'
-    r = requests.post(url, json={
-        'chat_id': TELEGRAM_CHAT_ID,
-        'text': text,
-        'parse_mode': 'HTML',
-        'disable_web_page_preview': True,
-    }, timeout=30)
-    r.raise_for_status()
-
-
-def send_telegram(text: str) -> None:
-    """Send, splitting into ≤4000-char chunks if needed."""
-    max_len = 4000
-    if len(text) <= max_len:
-        _send(text)
-        logger.info('Telegram message sent (%d chars)', len(text))
-        return
-
-    lines, chunk = text.split('\n'), ''
-    for line in lines:
-        if len(chunk) + len(line) + 1 > max_len:
-            _send(chunk.strip())
-            time.sleep(1)
-            chunk = ''
-        chunk += line + '\n'
-    if chunk.strip():
-        _send(chunk.strip())
-    logger.info('Telegram message sent in multiple chunks')
-
-
-# ── EDGAR data fetch ───────────────────────────────────────────────────────────
-
-def get_filings(start_date: str, end_date: str) -> list[dict]:
-    """Return deduplicated Form 4 filing stubs from EFTS."""
-    filings: list[dict] = []
-    seen_acc: set[str]  = set()
-    from_offset = 0
-    page_size   = 40
-
-    while True:
-        params = {
-            'q': '', 'forms': '4', 'dateRange': 'custom',
-            'startdt': start_date, 'enddt': end_date,
-            'from': from_offset,
-        }
-        try:
-            r = requests.get(EFTS_URL, params=params, headers=HEADERS, timeout=30)
-            r.raise_for_status()
-            data = r.json()
-        except Exception as e:
-            logger.error('EFTS request failed: %s', e)
-            break
-
-        hits = data.get('hits', {}).get('hits', [])
-        if not hits:
-            break
-
-        for hit in hits:
-            src = hit.get('_source', {})
-            acc = src.get('accession_no', '')
-            if acc and acc not in seen_acc:
-                seen_acc.add(acc)
+def get_recent_form4_filings(start_dt: str, end_dt: str) -> list[dict]:
+    filings = []
+    url = (
+        "https://efts.sec.gov/LATEST/search-index"
+        f"?q=%22%22&forms=4"
+        f"&dateRange=custom&startdt={start_dt}&enddt={end_dt}"
+        "&hits.hits.total.value=true"
+    )
+    try:
+        log.info("Querying EDGAR EFTS: %s", url)
+        r = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
+        r.raise_for_status()
+        data = r.json()
+        hits = data.get("hits", {}).get("hits", [])
+        log.info("EFTS returned %d raw hits", len(hits))
+        for h in hits:
+            src = h.get("_source", {})
+            accession = h.get("_id", "").replace("-", "")
+            if accession:
                 filings.append({
-                    'id':           hit.get('_id', ''),
-                    'accession_no': acc,
-                    'entity_name':  src.get('entity_name', ''),
+                    "accession": accession,
+                    "accession_fmt": h.get("_id", ""),
+                    "entity_name": src.get("entity_name", ""),
+                    "file_date": src.get("file_date", ""),
                 })
+        return filings
+    except Exception as e:
+        log.warning("EFTS query failed (%s), falling back to RSS", e)
 
-        total = data.get('hits', {}).get('total', {}).get('value', 0)
-        from_offset += page_size
-        if from_offset >= min(total, 400):
-            break
-        time.sleep(0.12)
+    rss_url = (
+        "https://www.sec.gov/cgi-bin/browse-edgar"
+        "?action=getcurrent&type=4&dateb=&owner=include&count=100"
+        "&search_text=&output=atom"
+    )
+    try:
+        log.info("Querying EDGAR RSS fallback")
+        r = requests.get(rss_url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
+        r.raise_for_status()
+        root = ET.fromstring(r.content)
+        ns = {"atom": "http://www.w3.org/2005/Atom"}
+        for entry in root.findall("atom:entry", ns):
+            updated = (entry.findtext("atom:updated", "", ns) or "")[:10]
+            if updated < start_dt:
+                continue
+            link = entry.find("atom:link", ns)
+            href = link.get("href", "") if link is not None else ""
+            acc_fmt = ""
+            if "/Archives/edgar/data/" in href:
+                parts = href.split("/")
+                for p in parts:
+                    if len(p) == 20 and "-" in p:
+                        acc_fmt = p
+                        break
+            if acc_fmt:
+                filings.append({
+                    "accession": acc_fmt.replace("-", ""),
+                    "accession_fmt": acc_fmt,
+                    "entity_name": entry.findtext("atom:company-name", "", ns),
+                    "file_date": updated,
+                })
+        log.info("RSS fallback returned %d filings", len(filings))
+    except Exception as e:
+        log.error("RSS fallback also failed: %s", e)
 
-    logger.info('Found %d unique Form 4 filings', len(filings))
     return filings
 
 
-def fetch_xml(filing_id: str) -> str | None:
-    """Fetch the Form 4 XML document using the EFTS _id path."""
-    # Direct XML hit
-    if filing_id.lower().endswith('.xml'):
-        try:
-            r = requests.get(EDGAR + filing_id, headers=HEADERS, timeout=20)
-            if r.ok:
-                return r.text
-        except Exception:
-            pass
-
-    # Derive directory and scan for XML
-    dir_path = filing_id.rsplit('/', 1)[0] if '/' in filing_id else filing_id
-    dir_url  = f'{EDGAR}{dir_path}/'
+def fetch_filing_xml(accession: str, entity_name: str) -> str | None:
+    acc_fmt = f"{accession[:10]}-{accession[10:12]}-{accession[12:]}"
+    company_url = (
+        f"https://efts.sec.gov/LATEST/search-index"
+        f"?q=%22{acc_fmt}%22&forms=4"
+    )
     try:
-        r = requests.get(dir_url, headers=HEADERS, timeout=20)
+        r = requests.get(company_url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
         r.raise_for_status()
+        hits = r.json().get("hits", {}).get("hits", [])
+        if not hits:
+            return None
+        src = hits[0].get("_source", {})
+        cik = str(src.get("entity_id", "")).zfill(10)
+        if not cik or cik == "0000000000":
+            return None
     except Exception as e:
-        logger.debug('Dir fetch failed %s: %s', dir_url, e)
+        log.debug("CIK lookup failed for %s: %s", accession, e)
         return None
 
-    links = re.findall(r'href="([^"]+\.xml)"', r.text, re.IGNORECASE)
-    if not links:
-        return None
-
-    preferred = [l for l in links if any(k in l.lower() for k in ['form4', 'form-4', 'ownership', 'doc'])]
-    target    = preferred[0] if preferred else links[0]
-    xml_url   = (EDGAR + target) if target.startswith('/') else (dir_url + target)
-
+    index_url = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{accession}/{acc_fmt}-index.json"
     try:
-        r = requests.get(xml_url, headers=HEADERS, timeout=20)
+        r = requests.get(index_url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
         r.raise_for_status()
-        return r.text
+        index = r.json()
+        xml_file = None
+        for doc in index.get("directory", {}).get("item", []):
+            name = doc.get("name", "")
+            if name.endswith(".xml") and "xsl" not in name.lower():
+                xml_file = name
+                break
+        if not xml_file:
+            return None
+        xml_url = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{accession}/{xml_file}"
+        r2 = requests.get(xml_url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
+        r2.raise_for_status()
+        return r2.text
     except Exception as e:
-        logger.debug('XML fetch failed %s: %s', xml_url, e)
+        log.debug("XML fetch failed for %s: %s", accession, e)
         return None
 
 
-# ── Parsing ────────────────────────────────────────────────────────────────────
-
-def parse_form4(xml_text: str) -> list[dict]:
-    """Extract qualifying purchase (P) transactions from a Form 4 XML."""
+def parse_form4_xml(xml_str: str) -> list[dict]:
     try:
-        root = ET.fromstring(xml_text)
-    except ET.ParseError:
+        root = ET.fromstring(xml_str)
+    except ET.ParseError as e:
+        log.debug("XML parse error: %s", e)
         return []
 
-    # Strip namespaces so paths work uniformly
-    for el in root.iter():
-        if '}' in el.tag:
-            el.tag = el.tag.split('}', 1)[1]
+    ticker   = (root.findtext(".//issuerTradingSymbol") or "").strip().upper()
+    company  = (root.findtext(".//issuerName") or "").strip()
+    owner    = (root.findtext(".//rptOwnerName") or "").strip()
+    title    = (root.findtext(".//officerTitle") or "").strip()
+    is_dir   = root.findtext(".//isDirector", "0") == "1"
+    is_10pct = root.findtext(".//isTenPercentOwner", "0") == "1"
+    role     = title if title else ("Director" if is_dir else ("10% Owner" if is_10pct else "Insider"))
 
-    def txt(node, path: str, default: str = '') -> str:
-        el = node.find(path)
-        return (el.text or '').strip() if el is not None else default
-
-    issuer   = txt(root, 'issuer/issuerName')
-    ticker   = (txt(root, 'issuer/issuerTradingSymbol') or '?').upper()
-    owner    = txt(root, 'reportingOwner/reportingOwnerId/rptOwnerName')
-    is_off   = txt(root, 'reportingOwner/reportingOwnerRelationship/isOfficer') == '1'
-    off_ttl  = txt(root, 'reportingOwner/reportingOwnerRelationship/officerTitle')
-    is_dir   = txt(root, 'reportingOwner/reportingOwnerRelationship/isDirector') == '1'
-    title    = off_ttl if (is_off and off_ttl) else ('Director' if is_dir else 'Insider')
-
-    results: list[dict] = []
-    for txn in root.findall('.//nonDerivativeTransaction'):
-        if txt(txn, 'transactionCoding/transactionCode') != 'P':
-            continue
-        if txt(txn, 'transactionAmounts/transactionAcquiredDisposedCode') != 'A':
+    results = []
+    for tx in root.findall(".//nonDerivativeTransaction"):
+        code     = (tx.findtext(".//transactionCode") or "").strip()
+        acquired = (tx.findtext(".//transactionAcquiredDisposedCode/value") or "").strip()
+        if code != "P" or acquired != "A":
             continue
         try:
-            shares = float(txt(txn, 'transactionAmounts/transactionShares', '0').replace(',', ''))
-            price  = float(txt(txn, 'transactionAmounts/transactionPricePerShare', '0').replace(',', ''))
-        except ValueError:
+            shares = float(tx.findtext(".//transactionShares/value") or 0)
+            price  = float(tx.findtext(".//transactionPricePerShare/value") or 0)
+            value  = shares * price
+        except (TypeError, ValueError):
             continue
-
-        value = shares * price
-        if value < MIN_VAL:
+        if value < MIN_VALUE:
             continue
-
-        try:
-            after  = float(txt(txn, 'postTransactionAmounts/sharesOwnedFollowingTransaction', '0').replace(',', ''))
-            is_new = (after - shares) <= 0
-        except ValueError:
-            is_new = False
-
         results.append({
-            'ticker':  ticker,
-            'company': issuer,
-            'owner':   owner,
-            'title':   title,
-            'shares':  shares,
-            'price':   price,
-            'value':   value,
-            'is_new':  is_new,
+            "ticker":  ticker or "???",
+            "company": company,
+            "owner":   owner,
+            "role":    role,
+            "shares":  int(shares),
+            "price":   price,
+            "value":   value,
         })
-
     return results
 
 
-# ── Formatting ─────────────────────────────────────────────────────────────────
+def send_telegram(text: str) -> bool:
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {
+        "chat_id":    TELEGRAM_CHAT_ID,
+        "text":       text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }
+    try:
+        r = requests.post(url, json=payload, timeout=15)
+        r.raise_for_status()
+        log.info("Telegram sent OK")
+        return True
+    except Exception as e:
+        log.error("Telegram failed: %s", e)
+        return False
 
-def format_message(purchases: list[dict], date_str: str) -> str:
+
+def format_message(filings: list[dict], start_dt: str, end_dt: str) -> str:
+    now_cet = datetime.datetime.now(CET).strftime("%Y-%m-%d %H:%M CET")
+    if not filings:
+        return (
+            f"📋 <b>SEC Form 4 — Insider Purchases</b>\n"
+            f"📅 {start_dt} → {end_dt}\n\n"
+            f"No qualifying open-market purchases (&gt;${MIN_VALUE:,}) found.\n\n"
+            f"<i>Scanned at {now_cet}</i>"
+        )
+    sorted_f = sorted(filings, key=lambda x: x["value"], reverse=True)[:MAX_RESULTS]
     lines = [
-        f'<b>🔍 SEC Form 4 Insider Purchases — {he(date_str)}</b>',
-        f'<i>{len(purchases)} qualifying purchase(s) above $100K — ranked by value</i>\n',
+        f"📋 <b>SEC Form 4 — Insider Purchases (Last 24h)</b>",
+        f"📅 {start_dt} → {end_dt} | {len(filings)} qualifying trade(s)\n",
     ]
-    for i, p in enumerate(purchases, 1):
-        pos = '🆕 New position' if p['is_new'] else '➕ Added to position'
+    for f in sorted_f:
+        v = f["value"]
+        val_str = f"${v/1_000_000:.2f}M" if v >= 1_000_000 else f"${v:,.0f}"
         lines.append(
-            f'<b>{i}. ${he(p["ticker"])}</b> — {he(p["company"])}\n'
-            f'   👤 {he(p["owner"])} | {he(p["title"])}\n'
-            f'   💰 ${p["value"]:,.0f}  ({p["shares"]:,.0f} sh @ ${p["price"]:.2f})\n'
-            f'   {pos}\n'
+            f"🟢 <b>${f['ticker']}</b> — {f['company']}\n"
+            f"   👤 {f['owner']} ({f['role']})\n"
+            f"   📈 {f['shares']:,} shares @ ${f['price']:.2f} = <b>{val_str}</b>\n"
         )
-    return '\n'.join(lines)
+    if len(filings) > MAX_RESULTS:
+        lines.append(f"<i>...and {len(filings) - MAX_RESULTS} more qualifying trades</i>\n")
+    lines.append(f"<i>Scanned at {now_cet}</i>")
+    return "\n".join(lines)
 
 
-# ── Orchestration ──────────────────────────────────────────────────────────────
-
-def run_scanner() -> None:
-    logger.info('=== Form 4 scanner starting ===')
-    now   = datetime.now(CET)
-    end   = now.strftime('%Y-%m-%d')
-    start = (now - timedelta(days=1)).strftime('%Y-%m-%d')
-
-    filings   = get_filings(start, end)
-    purchases: list[dict] = []
-
-    for idx, filing in enumerate(filings):
-        if not filing['id']:
+def run_scan():
+    log.info("=== SEC Form 4 scan starting ===")
+    now   = datetime.datetime.now(CET)
+    start = (now - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
+    end   = now.strftime("%Y-%m-%d")
+    raw_filings = get_recent_form4_filings(start, end)
+    log.info("Found %d Form 4 filings to inspect", len(raw_filings))
+    qualifying = []
+    for i, filing in enumerate(raw_filings):
+        acc = filing["accession"]
+        log.debug("[%d/%d] Fetching %s (%s)", i + 1, len(raw_filings), acc, filing.get("entity_name", ""))
+        xml_str = fetch_filing_xml(acc, filing.get("entity_name", ""))
+        if not xml_str:
             continue
-        xml = fetch_xml(filing['id'])
-        if xml:
-            purchases.extend(parse_form4(xml))
-        if idx % 25 == 0 and idx:
-            logger.info('Progress: %d/%d filings, %d purchases', idx, len(filings), len(purchases))
-        time.sleep(0.10)
-
-    # Deduplicate by (ticker, owner, rounded value)
-    seen: set = set()
-    unique:    list[dict] = []
-    for p in purchases:
-        key = (p['ticker'], p['owner'], round(p['value'], -2))
-        if key not in seen:
-            seen.add(key)
-            unique.append(p)
-
-    unique.sort(key=lambda x: x['value'], reverse=True)
-    logger.info('Qualifying purchases: %d', len(unique))
-
-    if not unique:
-        send_telegram(
-            '📋 <b>SEC Form 4 Insider Scanner</b>\n'
-            f'No qualifying insider purchases (&gt; $100K) found for {he(end)}.'
-        )
-    else:
-        send_telegram(format_message(unique[:20], end))
-
-    logger.info('=== Form 4 scanner done ===')
+        parsed = parse_form4_xml(xml_str)
+        qualifying.extend(parsed)
+        time.sleep(0.15)
+    log.info("Qualifying purchases: %d", len(qualifying))
+    msg = format_message(qualifying, start, end)
+    send_telegram(msg)
+    log.info("=== Scan complete ===")
 
 
-def next_run_seconds() -> float:
-    """Seconds until next 06:00 CET, accounting for DST."""
-    now    = datetime.now(CET)
-    target = now.replace(hour=6, minute=0, second=0, microsecond=0)
-    if now >= target:
-        target += timedelta(days=1)
-    return (target - now).total_seconds()
+def startup_message():
+    now_cet = datetime.datetime.now(CET).strftime("%Y-%m-%d %H:%M CET")
+    send_telegram(
+        f"🚀 <b>SEC Form 4 Scanner online</b>\n"
+        f"Daily scan at <b>{SCAN_HOUR_CET:02d}:00 CET</b>\n"
+        f"Filter: open-market purchases &gt; ${MIN_VALUE:,}\n"
+        f"Started: {now_cet}"
+    )
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
+    log.info("SEC Form 4 Scanner starting up")
+    startup_message()
+    schedule.every().day.at(f"{SCAN_HOUR_CET:02d}:00").do(run_scan)
+    log.info("Scheduled daily scan at %02d:00 CET", SCAN_HOUR_CET)
+    log.info("Running initial scan now...")
+    run_scan()
     while True:
-        try:
-            run_scanner()
-        except Exception as exc:
-            logger.exception('Unhandled scanner error: %s', exc)
-
-        secs = next_run_seconds()
-        logger.info('Next run in %.1f hours (06:00 CET)', secs / 3600)
-        time.sleep(secs)
+        schedule.run_pending()
+        time.sleep(60)
