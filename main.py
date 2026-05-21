@@ -35,7 +35,7 @@ EDGAR_HEADERS = {"User-Agent": "VMc1Investments scanner@vmc1.no"}
 EFTS_URL      = "https://efts.sec.gov/LATEST/search-index"
 
 # ── DB ────────────────────────────────────────────────────────────────────────
-DB_PATH = "/app/watchlist.db"
+DB_PATH = "/data/watchlist.db"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
