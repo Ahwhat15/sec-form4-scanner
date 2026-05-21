@@ -98,42 +98,50 @@ def fetch_all_filing_index(start_date: str, end_date: str) -> list[dict]:
 
 def parse_filing_meta(hit: dict):
     """
-    Extract CIK and accession number from an EFTS hit.
+    Extract CIK, accession number, and XML filename from an EFTS hit.
 
     Real _id format:  "0001628280-26-036379:wk-form4_1779220980.xml"
-    CIK is in:        _source.ciks[]   (list, company CIK is usually index 1)
-    Accession is the part before the colon in _id.
+    Accession:        part before the colon (also in _source.adsh)
+    XML filename:     part after the colon  ← must use this, not "{accession}.xml"
+    CIK:              _source.ciks[-1] (issuer is last in list)
     """
     hit_id = hit.get("_id", "")
     src    = hit.get("_source", {})
 
-    # Accession: everything before the colon
-    accession = hit_id.split(":")[0] if ":" in hit_id else None
+    # Extract accession and the actual XML filename from _id
+    if ":" in hit_id:
+        accession = hit_id.split(":")[0]
+        xml_filename = hit_id.split(":")[1]
+    else:
+        accession = hit_id
+        xml_filename = None
 
-    # Also available directly in _source as 'adsh'
+    # _source.adsh is the canonical accession number
     accession = src.get("adsh") or accession
 
-    # CIK: _source.ciks is a list; company CIK is typically index 1,
-    # reporter CIK is index 0. We need the company CIK to build the URL.
+    # CIK: _source.ciks is a list; issuer (company) is typically last
     ciks = src.get("ciks", [])
-    # The company (issuer) is usually the last CIK in the list
     company_cik = ciks[-1].lstrip("0") if ciks else None
 
-    return accession, company_cik, src
+    return accession, company_cik, xml_filename, src
 
 
-def parse_form4_xml(accession: str, company_cik: str, src: dict) -> list[dict]:
+def parse_form4_xml(accession: str, company_cik: str, xml_filename: str, src: dict) -> list[dict]:
     """
     Download and parse a Form 4 XML document.
     Returns qualifying open-market purchase transactions.
     """
-    if not accession or not company_cik:
+    if not accession or not company_cik or not xml_filename:
+        return []
+
+    # Only process XML files, skip HTM attachments (EX-24 power of attorney etc.)
+    if not xml_filename.lower().endswith(".xml"):
         return []
 
     acc_nodash = accession.replace("-", "")
     xml_url    = (
         f"https://www.sec.gov/Archives/edgar/data/"
-        f"{company_cik}/{acc_nodash}/{accession}.xml"
+        f"{company_cik}/{acc_nodash}/{xml_filename}"
     )
 
     try:
@@ -232,7 +240,7 @@ def run_scan():
     seen_accessions = set()  # deduplicate (EFTS returns one hit per file in a filing)
 
     for i, hit in enumerate(raw_hits):
-        accession, company_cik, src = parse_filing_meta(hit)
+        accession, company_cik, xml_filename, src = parse_filing_meta(hit)
 
         if not accession or accession in seen_accessions:
             continue
@@ -243,7 +251,7 @@ def run_scan():
         if file_type not in ("4", "") and not file_type.startswith("4"):
             continue
 
-        txns = parse_form4_xml(accession, company_cik, src)
+        txns = parse_form4_xml(accession, company_cik, xml_filename, src)
         if txns is None:
             errors += 1
         else:
