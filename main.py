@@ -29,6 +29,8 @@ RSI_PERIOD        = 14
 RSI_MIN           = 50
 EMA_PERIOD        = 20
 VOLUME_MULTIPLIER = 1.5
+MAX_INSIDER_PRICE   = 500      # filter data errors (e.g. $1191 instead of $1.191)
+MIN_AVG_DAILY_VOL   = 100_000  # shares — filter illiquid tickers
 
 # ── EDGAR ─────────────────────────────────────────────────────────────────────
 EDGAR_HEADERS = {"User-Agent": "VMc1Investments scanner@vmc1.no"}
@@ -293,12 +295,17 @@ def check_signal(data: dict, insider_buy_price: float) -> dict:
     rsi_ok        = data["rsi"] > RSI_MIN
     ema_ok        = data["price"] > data["ema20"]
     vol_ok        = data["volume"] > data["avg_volume"] * VOLUME_MULTIPLIER
+    sane_price = insider_buy_price <= MAX_INSIDER_PRICE
+    liquid     = data["avg_volume"] >= MIN_AVG_DAILY_VOL
+
     return {
-        "signal":        all([price_reclaim, rsi_ok, ema_ok, vol_ok]),
+        "signal":        all([price_reclaim, rsi_ok, ema_ok, vol_ok, sane_price, liquid]),
         "price_reclaim": price_reclaim,
         "rsi_ok":        rsi_ok,
         "ema_ok":        ema_ok,
         "vol_ok":        vol_ok,
+        "sane_price":    sane_price,
+        "liquid":        liquid,
         "price":         data["price"],
         "rsi":           round(data["rsi"], 1),
         "ema20":         round(data["ema20"], 2),
@@ -530,7 +537,8 @@ def run_watchlist_check():
 
         sig = check_signal(data, row["buy_price"])
         confirmations = sum([sig["price_reclaim"], sig["rsi_ok"],
-                             sig["ema_ok"], sig["vol_ok"]])
+                             sig["ema_ok"], sig["vol_ok"],
+                             sig["sane_price"], sig["liquid"]])
 
         log.info(
             f"  {ticker}: price={data['price']:.2f} insider={row['buy_price']:.2f} "
@@ -580,11 +588,16 @@ def run_watchlist_check():
         lines = ["👀 <b>VMc1 Watchlist — Near Signals</b>", ""]
         for row, sig, n in sorted(partial, key=lambda x: -x[2]):
             vol_ratio = sig["volume"] / sig["avg_volume"]
+            sanity = ""
+            if not sig["sane_price"]:
+                sanity += " ⚠️ price data error"
+            if not sig["liquid"]:
+                sanity += " ⚠️ illiquid"
             checks = (
                 f"{'✅' if sig['price_reclaim'] else '❌'} price "
                 f"{'✅' if sig['rsi_ok'] else '❌'} RSI={sig['rsi']} "
                 f"{'✅' if sig['ema_ok'] else '❌'} EMA "
-                f"{'✅' if sig['vol_ok'] else '❌'} vol"
+                f"{'✅' if sig['vol_ok'] else '❌'} vol{sanity}"
             )
             lines.append(
                 f"<b>${row['ticker']}</b> {n}/4\n"
