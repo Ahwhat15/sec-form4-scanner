@@ -256,8 +256,10 @@ Report back with a consolidated decision. This is a paper trade — no real capi
 def fetch_market_data(ticker: str) -> dict | None:
     try:
         import yfinance as yf
+        # Bypass yfinance cache to always get fresh data
         tk   = yf.Ticker(ticker)
-        hist = tk.history(period="60d", interval="1d")
+        tk._history = None  # clear any cached history
+        hist = tk.history(period="60d", interval="1d", auto_adjust=True)
         if hist.empty or len(hist) < EMA_PERIOD + 1:
             return None
 
@@ -543,13 +545,13 @@ def run_watchlist_check():
         log.info(
             f"  {ticker}: price={data['price']:.2f} insider={row['buy_price']:.2f} "
             f"RSI={sig['rsi']} EMA={sig['ema20']} "
-            f"vol={data['volume']/data['avg_volume']:.1f}x confirms={confirmations}/4"
+            f"vol={data['volume']/max(data['avg_volume'],1):.1f}x confirms={confirmations}/6"
         )
 
         if sig["signal"]:
             signals_fired.append((row, sig))
             db_mark_alerted(row["id"])
-        elif confirmations >= 2:
+        elif confirmations >= 3:
             partial.append((row, sig, confirmations))
 
         time.sleep(0.3)
@@ -558,7 +560,7 @@ def run_watchlist_check():
     for row, sig in signals_fired:
         days_since = (datetime.now(CET) -
                       datetime.fromisoformat(row["added_at"])).days
-        vol_ratio  = sig["volume"] / sig["avg_volume"]
+        vol_ratio  = sig["volume"] / max(sig["avg_volume"], 1)
         upside_pct = ((sig["price"] - row["buy_price"]) / row["buy_price"]) * 100
 
         # Telegram alert
@@ -587,7 +589,7 @@ def run_watchlist_check():
     if partial:
         lines = ["👀 <b>VMc1 Watchlist — Near Signals</b>", ""]
         for row, sig, n in sorted(partial, key=lambda x: -x[2]):
-            vol_ratio = sig["volume"] / sig["avg_volume"]
+            vol_ratio = sig["volume"] / max(sig["avg_volume"], 1)
             sanity = ""
             if not sig["sane_price"]:
                 sanity += " ⚠️ price data error"
