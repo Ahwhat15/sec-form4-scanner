@@ -139,6 +139,18 @@ def db_watchlist_count() -> int:
         ).fetchone()[0]
 
 
+def db_get_recently_added(minutes: int = 30) -> list:
+    """Return watchlist rows added within the last N minutes — for spot checks."""
+    cutoff = (datetime.now(CET) - timedelta(minutes=minutes)).isoformat()
+    with db_connect() as conn:
+        rows = conn.execute("""
+            SELECT * FROM watchlist
+            WHERE added_at >= ? AND alerted = 0
+            ORDER BY value DESC
+        """, (cutoff,)).fetchall()
+    return [dict(r) for r in rows]
+
+
 def db_get_conviction_score(ticker: str) -> int:
     """Count distinct insider buy events for this ticker in the watchlist."""
     with db_connect() as conn:
@@ -570,6 +582,117 @@ def run_scan(label: str = "morning"):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# SPOT CHECK  (runs ~5 min after intraday scan, new tickers only)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def run_spot_check():
+    """
+    Check only tickers added in the last 30 minutes.
+    Runs at 17:05 CET, right after the intraday scan.
+    Catches same-day filings while the US market is still open.
+    """
+    now = datetime.now(CET)
+    if now.weekday() >= 5:
+        return
+
+    new_rows = db_get_recently_added(minutes=30)
+    if not new_rows:
+        log.info("Spot check: no new tickers to check")
+        return
+
+    log.info(f"=== Spot check: {len(new_rows)} newly added tickers ===")
+
+    # Group by ticker
+    by_ticker: dict[str, list] = {}
+    for row in new_rows:
+        by_ticker.setdefault(row["ticker"], []).append(row)
+
+    signals_by_ticker: dict[str, list[tuple]] = {}
+
+    for ticker, rows in by_ticker.items():
+        data = fetch_market_data(ticker)
+        if not data:
+            continue
+
+        ticker_signals = []
+        for row in rows:
+            sig           = check_signal(data, row["buy_price"])
+            confirmations = sum([sig["price_reclaim"], sig["not_chasing"],
+                                 sig["rsi_ok"], sig["ema_ok"],
+                                 sig["vol_ok"], sig["sane_price"], sig["liquid"]])
+            log.info(
+                f"  [spot] {ticker}: price={data['price']:.2f} "
+                f"insider={row['buy_price']:.2f} RSI={sig['rsi']} "
+                f"vol={data['volume']/max(data['avg_volume'],1):.1f}x "
+                f"confirms={confirmations}/7"
+            )
+            if sig["signal"]:
+                ticker_signals.append((row, sig))
+                db_mark_alerted(row["id"])
+
+        if ticker_signals:
+            signals_by_ticker[ticker] = ticker_signals
+        time.sleep(0.3)
+
+    if not signals_by_ticker:
+        log.info("Spot check: no signals fired")
+        return
+
+    # Send alerts — same format as full watchlist check
+    for ticker, ticker_signals in signals_by_ticker.items():
+        row, sig   = max(ticker_signals, key=lambda x: x[0]["value"])
+        conviction = len(ticker_signals)
+        vol_ratio  = sig["volume"] / max(sig["avg_volume"], 1)
+        upside_pct = ((sig["price"] - row["buy_price"]) / row["buy_price"]) * 100
+        is_micro   = sig["avg_volume"] < MICRO_CAP_VOL_MAX
+
+        if conviction >= 3:
+            badge = "🔴 HIGH CONVICTION"
+        elif conviction == 2:
+            badge = "🔶 ELEVATED CONVICTION"
+        else:
+            badge = "🟡 STANDARD"
+
+        if is_micro:
+            micro_note = "\n  ⚠️ <b>MICRO-CAP MOMENTUM</b> — max $100, exit within 5 days"
+        else:
+            micro_note = ""
+
+        parts = [
+            f"⚡ <b>VMc1 INTRADAY SIGNAL — ${ticker}</b>  {badge}",
+            f"<i>{row['company']}</i>",
+            "<i>Filed today — market still open</i>",
+            "",
+            f"<b>Insider Context</b>",
+            f"  👤 {row['insider_name']} [{row['insider_role']}]",
+            f"  💰 {row['shares']:,.0f} sh @ ${row['buy_price']:.2f} (${row['value']:,.0f}) on {row['txn_date']}",
+        ]
+        if micro_note:
+            parts.append(micro_note)
+        parts += [
+            "",
+            "<b>Confirmations ✅ 4/4</b>",
+            f"  📈 ${sig['price']:.2f} vs insider ${row['buy_price']:.2f} ({upside_pct:+.1f}%) ✅",
+            f"  📊 RSI {sig['rsi']} > {RSI_MIN} ✅",
+            f"  〰️ Price > 20 EMA (${sig['ema20']:.2f}) ✅",
+            f"  🔊 Volume {vol_ratio:.1f}x avg ✅",
+            "",
+            "<i>⚡ Same-day signal — 🤖 VMc1 agents briefed</i>",
+        ]
+        msg = "\n".join(parts)
+        send_telegram(msg)
+
+        paperclip_ok = notify_paperclip_ceo(ticker, ticker_signals,
+                                            {"avg_volume": sig["avg_volume"]})
+        log.info(
+            f"SPOT SIGNAL: ${ticker} conviction={conviction} "
+            f"| Paperclip: {'OK' if paperclip_ok else 'FAILED'}"
+        )
+
+    log.info(f"=== Spot check complete: {len(signals_by_ticker)} signals fired ===")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # WATCHLIST SIGNAL CHECK  (21:00 CET daily)
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -726,13 +849,14 @@ def main():
         "✅ <b>SEC Form 4 Scanner</b> online\n"
         "📋 Watchlist monitor active\n"
         "🤖 VMc1 Paperclip integration enabled\n"
-        "⚡ Intraday scan added (17:00 CET)"
+        "⚡ Intraday scan + spot check (17:00 / 17:05 CET)"
     )
 
     schedule.every().day.at("06:00").do(lambda: run_scan("morning"))
     schedule.every().day.at("17:00").do(lambda: run_scan("intraday"))
+    schedule.every().day.at("17:05").do(run_spot_check)
     schedule.every().day.at("21:00").do(run_watchlist_check)
-    log.info("Scheduled: scan @ 06:00 + 17:00 CET | watchlist check @ 21:00 CET")
+    log.info("Scheduled: scan @ 06:00 + 17:00 CET | spot check @ 17:05 | watchlist check @ 21:00 CET")
 
     log.info("Running initial scan now...")
     run_scan("startup")
