@@ -28,10 +28,17 @@ WATCHLIST_EXPIRY_DAYS     = 30
 RSI_PERIOD          = 14
 RSI_MIN             = 50
 EMA_PERIOD          = 20
-VOLUME_MULTIPLIER   = 1.5
+VOLUME_MULTIPLIER_STANDARD  = 1.1   # Tier 2: single buy, <$1M, INS role
+VOLUME_MULTIPLIER_HIGH      = 0.0   # Tier 1: CEO/DIR multi-buy or >$1M — no vol requirement
 MAX_INSIDER_PRICE   = 500       # filter data errors (e.g. $1191 instead of $1.191)
 MIN_AVG_DAILY_VOL   = 100_000   # shares — filter illiquid tickers
 MAX_ABOVE_INSIDER   = 0.25      # skip if price already >25% above insider buy price
+MAX_TXN_AGE_DAYS    = 30        # skip transactions older than 30 days (late amendments)
+FUND_KEYWORDS       = {         # skip self-purchases by funds/ETFs
+    "fund", "trust", "etf", "inc.", "lp", "llc", "management",
+    "capital", "asset", "partners", "investments", "advisors",
+    "group", "global", "corp.", "s.a.", "limited",
+}
 MICRO_CAP_VOL_MAX   = 300_000   # flag as micro-cap momentum if avg vol below this
 
 # ── EDGAR ─────────────────────────────────────────────────────────────────────
@@ -357,19 +364,27 @@ def fetch_market_data(ticker: str) -> dict | None:
         return None
 
 
-def check_signal(data: dict, insider_buy_price: float) -> dict:
+def check_signal(data: dict, insider_buy_price: float, conviction: int = 1, is_director: bool = False, value: float = 0) -> dict:
     already_moved = (data["price"] - insider_buy_price) / max(insider_buy_price, 0.01)
     price_reclaim = data["price"] > insider_buy_price
     not_chasing   = already_moved <= MAX_ABOVE_INSIDER
     rsi_ok        = data["rsi"] > RSI_MIN
     ema_ok        = data["price"] > data["ema20"]
-    vol_ok        = data["volume"] > data["avg_volume"] * VOLUME_MULTIPLIER
     sane_price    = insider_buy_price <= MAX_INSIDER_PRICE
     liquid        = data["avg_volume"] >= MIN_AVG_DAILY_VOL
+
+    # Tier 1: director or multi-buy or >$1M — no volume requirement
+    # Tier 2: standard — need 1.1x average volume
+    high_conviction = is_director or conviction >= 2 or value >= 1_000_000
+    if high_conviction:
+        vol_ok = True   # volume not required for high conviction
+    else:
+        vol_ok = data["volume"] > data["avg_volume"] * VOLUME_MULTIPLIER_STANDARD
 
     return {
         "signal":        all([price_reclaim, not_chasing, rsi_ok, ema_ok,
                               vol_ok, sane_price, liquid]),
+        "high_conviction": high_conviction,
         "price_reclaim": price_reclaim,
         "not_chasing":   not_chasing,
         "rsi_ok":        rsi_ok,
@@ -436,6 +451,34 @@ def parse_filing_meta(hit: dict):
     return accession, company_cik, xml_filename, src
 
 
+def is_self_purchase(issuer_name: str, reporter_name: str) -> bool:
+    """
+    Returns True if the reporter appears to be a fund buying its own units
+    e.g. 'RBC Global Asset Management' buying 'RBC BlueBay Enhanced Income'.
+    Heuristic: check if 3+ words overlap between issuer and reporter names.
+    """
+    if not issuer_name or not reporter_name:
+        return False
+    issuer_words   = set(issuer_name.lower().split()) - FUND_KEYWORDS - {"the", "of", "and"}
+    reporter_words = set(reporter_name.lower().split()) - FUND_KEYWORDS - {"the", "of", "and"}
+    overlap = issuer_words & reporter_words
+    return len(overlap) >= 2
+
+
+def is_stale_transaction(txn_date: str, max_days: int = MAX_TXN_AGE_DAYS) -> bool:
+    """Returns True if the transaction date is older than max_days."""
+    if not txn_date:
+        return False
+    try:
+        # Handle dates with timezone suffix like "2026-05-27-05:00"
+        clean = txn_date[:10]
+        txn_dt = datetime.strptime(clean, "%Y-%m-%d").replace(tzinfo=CET)
+        age = (datetime.now(CET) - txn_dt).days
+        return age > max_days
+    except Exception:
+        return False
+
+
 def parse_form4_xml(accession: str, company_cik: str,
                     xml_filename: str, src: dict) -> list[dict]:
     if not accession or not company_cik or not xml_filename:
@@ -468,6 +511,11 @@ def parse_form4_xml(accession: str, company_cik: str,
         names = src.get("display_names", [])
         issuer_name = names[-1].split("  (CIK")[0] if names else ""
 
+    # Skip fund self-purchases
+    if is_self_purchase(issuer_name, reporter_name):
+        log.debug(f"Skipping self-purchase: {reporter_name} buying {issuer_name}")
+        return []
+
     results = []
     for txn in root.findall(".//nonDerivativeTransaction"):
         code = txt(txn, "transactionCoding/transactionCode")
@@ -481,6 +529,10 @@ def parse_form4_xml(accession: str, company_cik: str,
             continue
         if value < MIN_TRANSACTION_VALUE:
             continue
+        txn_date_val = txt(txn, "transactionDate/value")
+        if is_stale_transaction(txn_date_val):
+            log.debug(f"Skipping stale transaction {txn_date_val} for {issuer_ticker}")
+            continue
         results.append({
             "ticker":      issuer_ticker or "N/A",
             "company":     issuer_name,
@@ -491,7 +543,7 @@ def parse_form4_xml(accession: str, company_cik: str,
             "shares":      shares,
             "price":       price,
             "value":       value,
-            "date":        txt(txn, "transactionDate/value"),
+            "date":        txn_date_val,
         })
     return results
 
@@ -616,12 +668,16 @@ def run_spot_check():
 
         ticker_signals = []
         for row in rows:
-            sig           = check_signal(data, row["buy_price"])
+            sig           = check_signal(data, row["buy_price"],
+                                          conviction=len(rows),
+                                          is_director=(row["insider_role"] == "DIR"),
+                                          value=row["value"])
             confirmations = sum([sig["price_reclaim"], sig["not_chasing"],
                                  sig["rsi_ok"], sig["ema_ok"],
                                  sig["vol_ok"], sig["sane_price"], sig["liquid"]])
+            tier = "T1" if sig["high_conviction"] else "T2"
             log.info(
-                f"  [spot] {ticker}: price={data['price']:.2f} "
+                f"  [spot] {ticker} [{tier}]: price={data['price']:.2f} "
                 f"insider={row['buy_price']:.2f} RSI={sig['rsi']} "
                 f"vol={data['volume']/max(data['avg_volume'],1):.1f}x "
                 f"confirms={confirmations}/7"
@@ -728,13 +784,17 @@ def run_watchlist_check():
         best_partial   = None
 
         for row in rows:
-            sig           = check_signal(data, row["buy_price"])
+            sig           = check_signal(data, row["buy_price"],
+                                          conviction=len(rows),
+                                          is_director=(row["insider_role"] == "DIR"),
+                                          value=row["value"])
             confirmations = sum([sig["price_reclaim"], sig["not_chasing"],
                                  sig["rsi_ok"], sig["ema_ok"],
                                  sig["vol_ok"], sig["sane_price"], sig["liquid"]])
+            tier = "T1" if sig["high_conviction"] else "T2"
 
             log.info(
-                f"  {ticker}: price={data['price']:.2f} insider={row['buy_price']:.2f} "
+                f"  {ticker} [{tier}]: price={data['price']:.2f} insider={row['buy_price']:.2f} "
                 f"RSI={sig['rsi']} EMA={sig['ema20']} "
                 f"vol={data['volume']/max(data['avg_volume'],1):.1f}x "
                 f"moved={sig['already_moved']*100:.1f}% confirms={confirmations}/7"
