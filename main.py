@@ -25,12 +25,14 @@ INCLUDE_TRANSACTION_CODES = {"P"}
 WATCHLIST_EXPIRY_DAYS     = 30
 
 # ── Signal thresholds ─────────────────────────────────────────────────────────
-RSI_PERIOD        = 14
-RSI_MIN           = 50
-EMA_PERIOD        = 20
-VOLUME_MULTIPLIER = 1.5
-MAX_INSIDER_PRICE   = 500      # filter data errors (e.g. $1191 instead of $1.191)
-MIN_AVG_DAILY_VOL   = 100_000  # shares — filter illiquid tickers
+RSI_PERIOD          = 14
+RSI_MIN             = 50
+EMA_PERIOD          = 20
+VOLUME_MULTIPLIER   = 1.5
+MAX_INSIDER_PRICE   = 500       # filter data errors (e.g. $1191 instead of $1.191)
+MIN_AVG_DAILY_VOL   = 100_000   # shares — filter illiquid tickers
+MAX_ABOVE_INSIDER   = 0.25      # skip if price already >25% above insider buy price
+MICRO_CAP_VOL_MAX   = 300_000   # flag as micro-cap momentum if avg vol below this
 
 # ── EDGAR ─────────────────────────────────────────────────────────────────────
 EDGAR_HEADERS = {"User-Agent": "VMc1Investments scanner@vmc1.no"}
@@ -40,10 +42,10 @@ EFTS_URL      = "https://efts.sec.gov/LATEST/search-index"
 DB_PATH = "/data/watchlist.db"
 
 # ── Paperclip VMc1 ────────────────────────────────────────────────────────────
-PAPERCLIP_BASE_URL  = os.environ.get("PAPERCLIP_BASE_URL", "")
-PAPERCLIP_JWT       = os.environ.get("PAPERCLIP_JWT_SECRET", "")
-VMC1_COMPANY_ID     = "dc2df96a-a846-4634-a9a0-24e593916c75"
-VMC1_CEO_AGENT_ID   = "3db60f1f-86fd-461e-a7bd-96392fa2c893"
+PAPERCLIP_BASE_URL = os.environ.get("PAPERCLIP_BASE_URL", "")
+PAPERCLIP_JWT      = os.environ.get("PAPERCLIP_JWT_SECRET", "")
+VMC1_COMPANY_ID    = "dc2df96a-a846-4634-a9a0-24e593916c75"
+VMC1_CEO_AGENT_ID  = "3db60f1f-86fd-461e-a7bd-96392fa2c893"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -137,6 +139,15 @@ def db_watchlist_count() -> int:
         ).fetchone()[0]
 
 
+def db_get_conviction_score(ticker: str) -> int:
+    """Count distinct insider buy events for this ticker in the watchlist."""
+    with db_connect() as conn:
+        return conn.execute(
+            "SELECT COUNT(*) FROM watchlist WHERE ticker = ? AND alerted = 0",
+            (ticker,)
+        ).fetchone()[0]
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # TELEGRAM
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -164,57 +175,100 @@ def send_telegram(text: str) -> bool:
 # PAPERCLIP VMc1 INTEGRATION
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def notify_paperclip_ceo(row: dict, sig: dict) -> bool:
+def notify_paperclip_ceo(ticker: str, signals: list[tuple], market_data: dict) -> bool:
     """
-    Create a task in Paperclip assigned to the CEO agent.
-    The CEO wakes (wakeOnDemand=true) and delegates the full
-    Research → Backtest → Risk → Execution chain.
+    Create ONE task per ticker per run, consolidating all watchlist entries.
+    Includes conviction score and micro-cap flag in the briefing.
     """
     if not PAPERCLIP_BASE_URL or not PAPERCLIP_JWT:
         log.warning("Paperclip env vars not set — skipping CEO notification")
         return False
 
-    days_since  = (datetime.now(CET) - datetime.fromisoformat(row["added_at"])).days
-    vol_ratio   = sig["volume"] / sig["avg_volume"]
-    upside_pct  = ((sig["price"] - row["buy_price"]) / row["buy_price"]) * 100
+    # Use the highest-value row as the primary signal
+    row, sig = max(signals, key=lambda x: x[0]["value"])
 
-    task_title = f"[INSIDER SIGNAL] ${row['ticker']} — 4/4 Buy Confirmations"
+    conviction      = len(signals)
+    vol_ratio       = sig["volume"] / max(sig["avg_volume"], 1)
+    upside_pct      = ((sig["price"] - row["buy_price"]) / row["buy_price"]) * 100
+    days_since      = (datetime.now(CET) - datetime.fromisoformat(row["added_at"])).days
+    is_micro_cap    = sig["avg_volume"] < MICRO_CAP_VOL_MAX
+    avg_vol_k       = sig["avg_volume"] / 1000
+
+    # Conviction label
+    if conviction >= 3:
+        conviction_label = "🔴 HIGH CONVICTION — 3+ separate buy events"
+        strategy_note   = "Multi-day accumulation pattern detected. Weight position sizing accordingly."
+    elif conviction == 2:
+        conviction_label = "🔶 ELEVATED CONVICTION — 2 separate buy events"
+        strategy_note   = "Repeated buying suggests insider confidence. Standard VMc1 position sizing."
+    else:
+        conviction_label = "🟡 STANDARD — single buy event"
+        strategy_note   = "Single insider buy. Apply standard VMc1 rules."
+
+    # Micro-cap flag
+    micro_cap_note = ""
+    if is_micro_cap:
+        micro_cap_note = f"""
+### ⚠️ MICRO-CAP MOMENTUM FLAG
+Average daily volume is {avg_vol_k:.0f}k shares (below {MICRO_CAP_VOL_MAX/1000:.0f}k threshold).
+- **Treat as momentum trade, not value investment**
+- **Max position: $100** (half normal VMc1 size)
+- **Exit window: 1-5 days maximum**
+- **Scale out in thirds**: 1/3 at +15%, 1/3 at +30%, trail remainder
+- **Hard stop**: entry day low
+- **Do NOT average down** if price returns to insider level
+- Research Agent: verify avg daily dollar volume and check for pump-and-dump indicators
+"""
+
+    # All buy events for this ticker
+    buy_events = "\n".join([
+        f"  - {r['insider_name']} [{r['insider_role']}]: "
+        f"{r['shares']:,.0f} sh @ ${r['buy_price']:.2f} = ${r['value']:,.0f} on {r['txn_date']}"
+        for r, _ in sorted(signals, key=lambda x: x[0]["txn_date"] or "")
+    ])
+
+    task_title = f"[INSIDER SIGNAL] ${ticker} — {conviction_label}"
 
     task_body = f"""## VMc1 Insider Flow Signal — Action Required
 
-**Ticker:** ${row['ticker']}
+**Ticker:** ${ticker}
 **Company:** {row['company']}
 **Signal Date:** {datetime.now(CET).strftime('%Y-%m-%d')}
+**Conviction:** {conviction_label}
 
 ---
 
-### Insider Context
-- **Insider:** {row['insider_name']} [{row['insider_role']}]
-- **Purchase:** {row['shares']:,.0f} shares @ ${row['buy_price']:.2f} = ${row['value']:,.0f}
-- **Transaction Date:** {row['txn_date']}
-- **Days Since Filing:** {days_since}
+### All Insider Buy Events ({conviction} total)
+{buy_events}
 
 ---
 
 ### Technical Confirmations (4/4) ✅
-- Price ${sig['price']:.2f} > Insider buy price ${row['buy_price']:.2f} ({upside_pct:+.1f}%) ✅
+- Price ${sig['price']:.2f} > Highest insider buy ${row['buy_price']:.2f} ({upside_pct:+.1f}%) ✅
 - RSI {sig['rsi']} > {RSI_MIN} ✅
 - Price > 20 EMA (${sig['ema20']:.2f}) ✅
 - Volume {vol_ratio:.1f}x above 20-day average ✅
+- Avg daily volume: {avg_vol_k:.0f}k shares
+- Signal fired {days_since}d after first filing
+{micro_cap_note}
+---
+
+### Strategy Note
+{strategy_note}
 
 ---
 
 ### Requested Actions
 
-1. **Research Agent** — Pull company fundamentals, recent news, sector context, and insider's historical trade performance. Score conviction (1–10).
+1. **Research Agent** — Pull fundamentals, recent news, sector context, insider history for ${ticker}. Score conviction (1–10). Flag any red flags (dilution, debt, litigation).
 
-2. **Backtest Agent** — Run the insider-buy + 4-confirmation strategy on ${row['ticker']} historically. Report win rate, avg return, and max drawdown.
+2. **Backtest Agent** — Run insider-buy + 4-confirmation strategy on ${ticker} historically. Report win rate, avg return, max drawdown.
 
-3. **Risk Management Agent** — Size the position using VMc1 rules ($200/trade, stop = 2% below insider buy price ${row['buy_price']:.2f}, target = 3:1 R:R). Approve or reject.
+3. **Risk Management Agent** — Size position per VMc1 rules. {'$100 max for micro-cap momentum.' if is_micro_cap else '$200 standard position.'} Stop = 2% below ${row['buy_price']:.2f}. Target = 3:1 R:R. Approve or reject.
 
-4. **Execution Agent** — If Risk approves, place the paper trade on Alpaca immediately. Report entry price, stop, target, and position size.
+4. **Execution Agent** — If Risk approves, place paper trade on Alpaca. Report entry, stop, target, size.
 
-Report back with a consolidated decision. This is a paper trade — no real capital at risk.
+This is a paper trade — no real capital at risk.
 """
 
     url     = f"{PAPERCLIP_BASE_URL}/api/companies/{VMC1_COMPANY_ID}/issues"
@@ -233,19 +287,19 @@ Report back with a consolidated decision. This is a paper trade — no real capi
     try:
         r = requests.post(url, json=payload, headers=headers, timeout=15)
         r.raise_for_status()
-        issue = r.json()
+        issue    = r.json()
         issue_id = issue.get("issuePrefix", "VMC") + "-" + str(issue.get("number", "?"))
-        log.info(f"Paperclip task created: {issue_id} for {row['ticker']}")
+        log.info(f"Paperclip task created: {issue_id} for ${ticker} (conviction={conviction})")
 
-        # Wake the CEO agent immediately via heartbeat trigger
+        # Wake the CEO
         wake_url = (f"{PAPERCLIP_BASE_URL}/api/companies/{VMC1_COMPANY_ID}"
                     f"/agents/{VMC1_CEO_AGENT_ID}/heartbeat")
         requests.post(wake_url, headers=headers, timeout=10)
-        log.info(f"CEO agent heartbeat triggered")
+        log.info("CEO agent heartbeat triggered")
         return True
 
     except Exception as e:
-        log.error(f"Paperclip notification failed for {row['ticker']}: {e}")
+        log.error(f"Paperclip notification failed for ${ticker}: {e}")
         return False
 
 
@@ -256,10 +310,9 @@ Report back with a consolidated decision. This is a paper trade — no real capi
 def fetch_market_data(ticker: str) -> dict | None:
     try:
         import yfinance as yf
-        # Bypass yfinance cache to always get fresh data
-        tk   = yf.Ticker(ticker)
-        tk._history = None  # clear any cached history
-        hist = tk.history(period="60d", interval="1d", auto_adjust=True)
+        tk        = yf.Ticker(ticker)
+        tk._history = None
+        hist      = tk.history(period="60d", interval="1d", auto_adjust=True)
         if hist.empty or len(hist) < EMA_PERIOD + 1:
             return None
 
@@ -281,7 +334,7 @@ def fetch_market_data(ticker: str) -> dict | None:
             (gains if d >= 0 else losses).append(abs(d))
         avg_gain = sum(gains) / RSI_PERIOD if gains else 0
         avg_loss = sum(losses) / RSI_PERIOD if losses else 1e-9
-        rsi = 100 - (100 / (1 + avg_gain / avg_loss))
+        rsi      = 100 - (100 / (1 + avg_gain / avg_loss))
 
         avg_vol = sum(volumes[-EMA_PERIOD:]) / EMA_PERIOD
 
@@ -293,21 +346,26 @@ def fetch_market_data(ticker: str) -> dict | None:
 
 
 def check_signal(data: dict, insider_buy_price: float) -> dict:
+    already_moved = (data["price"] - insider_buy_price) / max(insider_buy_price, 0.01)
     price_reclaim = data["price"] > insider_buy_price
+    not_chasing   = already_moved <= MAX_ABOVE_INSIDER
     rsi_ok        = data["rsi"] > RSI_MIN
     ema_ok        = data["price"] > data["ema20"]
     vol_ok        = data["volume"] > data["avg_volume"] * VOLUME_MULTIPLIER
-    sane_price = insider_buy_price <= MAX_INSIDER_PRICE
-    liquid     = data["avg_volume"] >= MIN_AVG_DAILY_VOL
+    sane_price    = insider_buy_price <= MAX_INSIDER_PRICE
+    liquid        = data["avg_volume"] >= MIN_AVG_DAILY_VOL
 
     return {
-        "signal":        all([price_reclaim, rsi_ok, ema_ok, vol_ok, sane_price, liquid]),
+        "signal":        all([price_reclaim, not_chasing, rsi_ok, ema_ok,
+                              vol_ok, sane_price, liquid]),
         "price_reclaim": price_reclaim,
+        "not_chasing":   not_chasing,
         "rsi_ok":        rsi_ok,
         "ema_ok":        ema_ok,
         "vol_ok":        vol_ok,
         "sane_price":    sane_price,
         "liquid":        liquid,
+        "already_moved": already_moved,
         "price":         data["price"],
         "rsi":           round(data["rsi"], 1),
         "ema20":         round(data["ema20"], 2),
@@ -336,7 +394,7 @@ def fetch_all_filing_index(start_date: str, end_date: str) -> list[dict]:
             break
         hits_obj = data.get("hits", {})
         if total_exp is None:
-            t = hits_obj.get("total", {})
+            t         = hits_obj.get("total", {})
             total_exp = t.get("value", 0) if isinstance(t, dict) else int(t or 0)
             log.info(f"EFTS total Form 4 filings in range: {total_exp}")
         batch = hits_obj.get("hits", [])
@@ -366,7 +424,8 @@ def parse_filing_meta(hit: dict):
     return accession, company_cik, xml_filename, src
 
 
-def parse_form4_xml(accession: str, company_cik: str, xml_filename: str, src: dict) -> list[dict]:
+def parse_form4_xml(accession: str, company_cik: str,
+                    xml_filename: str, src: dict) -> list[dict]:
     if not accession or not company_cik or not xml_filename:
         return []
     if not xml_filename.lower().endswith(".xml"):
@@ -426,16 +485,16 @@ def parse_form4_xml(accession: str, company_cik: str, xml_filename: str, src: di
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# DAILY SCAN JOB
+# SCAN JOBS  (06:00 and 17:00 CET)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def run_scan():
+def run_scan(label: str = "morning"):
     now = datetime.now(CET)
     if now.weekday() >= 5:
-        log.info(f"Weekend — skipping scan ({now.strftime('%A')})")
+        log.info(f"Weekend — skipping {label} scan ({now.strftime('%A')})")
         return
 
-    log.info("=== SEC Form 4 scan starting ===")
+    log.info(f"=== SEC Form 4 {label} scan starting ===")
     end_date   = now.strftime("%Y-%m-%d")
     start_date = (now - timedelta(days=1)).strftime("%Y-%m-%d")
     log.info(f"Date range: {start_date} → {end_date}")
@@ -444,7 +503,11 @@ def run_scan():
     log.info(f"Found {len(raw_hits)} Form 4 filings to inspect")
 
     if not raw_hits:
-        send_telegram(f"📋 <b>SEC Form 4 Scan</b>\n<i>{start_date}</i>\n\nNo filings found.")
+        if label == "morning":
+            send_telegram(
+                f"📋 <b>SEC Form 4 Scan</b>\n<i>{start_date}</i>\n\nNo filings found."
+            )
+        log.info(f"=== {label} scan complete ===")
         return
 
     qualifying      = []
@@ -479,15 +542,11 @@ def run_scan():
     log.info(f"Added {new_additions} new tickers to watchlist")
 
     if not qualifying:
-        msg = (f"📋 <b>SEC Form 4 Insider Scan</b>\n<i>{start_date} → {end_date}</i>\n\n"
-               f"No qualifying purchases ≥ ${MIN_TRANSACTION_VALUE:,}\n"
-               f"<i>Scanned {len(seen_accessions):,} unique filings</i>")
-        send_telegram(msg)
-        log.info("=== Scan complete ===")
+        log.info(f"=== {label} scan complete ===")
         return
 
     lines = [
-        "🔍 <b>SEC Form 4 — Insider Purchases</b>",
+        f"🔍 <b>SEC Form 4 — Insider Purchases</b> <i>({label})</i>",
         f"<i>{start_date} → {end_date}</i>",
         f"<i>{len(seen_accessions):,} filings · {len(qualifying)} qualifying · "
         f"+{new_additions} added to watchlist ({db_watchlist_count()} active)</i>",
@@ -500,17 +559,18 @@ def run_scan():
         lines.append(
             f"<b>${t['ticker']}</b>  {company}\n"
             f"  👤 {t['name']} [{role}]{title}\n"
-            f"  {t['shares']:,.0f} sh @ ${t['price']:.2f} = <b>${t['value']:,.0f}</b>  📅 {t['date']}"
+            f"  {t['shares']:,.0f} sh @ ${t['price']:.2f} = "
+            f"<b>${t['value']:,.0f}</b>  📅 {t['date']}"
         )
     if len(qualifying) > 15:
         lines.append(f"\n<i>… and {len(qualifying) - 15} more</i>")
 
     send_telegram("\n".join(lines))
-    log.info("=== Scan complete ===")
+    log.info(f"=== {label} scan complete ===")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# WATCHLIST SIGNAL CHECK  (21:00 CET daily — after US market close)
+# WATCHLIST SIGNAL CHECK  (21:00 CET daily)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def run_watchlist_check():
@@ -527,53 +587,83 @@ def run_watchlist_check():
         log.info("Watchlist empty — nothing to check")
         return
 
-    signals_fired = []
-    partial       = []
-
+    # Group rows by ticker first
+    by_ticker: dict[str, list] = {}
     for row in active:
-        ticker = row["ticker"]
-        data   = fetch_market_data(ticker)
+        by_ticker.setdefault(row["ticker"], []).append(row)
+
+    signals_by_ticker: dict[str, list[tuple]] = {}  # ticker → [(row, sig), ...]
+    partial_by_ticker: dict[str, tuple]        = {}  # ticker → (best_row, best_sig, count)
+
+    for ticker, rows in by_ticker.items():
+        data = fetch_market_data(ticker)
         if not data:
             log.debug(f"No market data for {ticker}")
             continue
 
-        sig = check_signal(data, row["buy_price"])
-        confirmations = sum([sig["price_reclaim"], sig["rsi_ok"],
-                             sig["ema_ok"], sig["vol_ok"],
-                             sig["sane_price"], sig["liquid"]])
+        ticker_signals = []
+        best_partial   = None
 
-        log.info(
-            f"  {ticker}: price={data['price']:.2f} insider={row['buy_price']:.2f} "
-            f"RSI={sig['rsi']} EMA={sig['ema20']} "
-            f"vol={data['volume']/max(data['avg_volume'],1):.1f}x confirms={confirmations}/6"
-        )
+        for row in rows:
+            sig           = check_signal(data, row["buy_price"])
+            confirmations = sum([sig["price_reclaim"], sig["not_chasing"],
+                                 sig["rsi_ok"], sig["ema_ok"],
+                                 sig["vol_ok"], sig["sane_price"], sig["liquid"]])
 
-        if sig["signal"]:
-            signals_fired.append((row, sig))
-            db_mark_alerted(row["id"])
-        elif confirmations >= 3:
-            partial.append((row, sig, confirmations))
+            log.info(
+                f"  {ticker}: price={data['price']:.2f} insider={row['buy_price']:.2f} "
+                f"RSI={sig['rsi']} EMA={sig['ema20']} "
+                f"vol={data['volume']/max(data['avg_volume'],1):.1f}x "
+                f"moved={sig['already_moved']*100:.1f}% confirms={confirmations}/7"
+            )
+
+            if sig["signal"]:
+                ticker_signals.append((row, sig))
+                db_mark_alerted(row["id"])
+            elif confirmations >= 3:
+                if best_partial is None or confirmations > best_partial[2]:
+                    best_partial = (row, sig, confirmations)
+
+        if ticker_signals:
+            signals_by_ticker[ticker] = ticker_signals
+        elif best_partial:
+            partial_by_ticker[ticker] = best_partial
 
         time.sleep(0.3)
 
-    # ── Full signals → Telegram + Paperclip CEO ───────────────────────────────
-    for row, sig in signals_fired:
-        days_since = (datetime.now(CET) -
-                      datetime.fromisoformat(row["added_at"])).days
-        vol_ratio  = sig["volume"] / max(sig["avg_volume"], 1)
-        upside_pct = ((sig["price"] - row["buy_price"]) / row["buy_price"]) * 100
+    # ── Full signals — one Telegram + one Paperclip task per ticker ───────────
+    for ticker, ticker_signals in signals_by_ticker.items():
+        row, sig    = max(ticker_signals, key=lambda x: x[0]["value"])
+        conviction  = len(ticker_signals)
+        vol_ratio   = sig["volume"] / max(sig["avg_volume"], 1)
+        upside_pct  = ((sig["price"] - row["buy_price"]) / row["buy_price"]) * 100
+        days_since  = (datetime.now(CET) -
+                       datetime.fromisoformat(row["added_at"])).days
+        is_micro    = sig["avg_volume"] < MICRO_CAP_VOL_MAX
 
-        # Telegram alert
+        # Conviction badge
+        if conviction >= 3:
+            badge = "🔴 HIGH CONVICTION"
+        elif conviction == 2:
+            badge = "🔶 ELEVATED CONVICTION"
+        else:
+            badge = "🟡 STANDARD"
+
+        micro_note = "\n  ⚠️ <b>MICRO-CAP MOMENTUM</b> — max $100, exit within 5 days" \
+                     if is_micro else ""
+
         msg = (
-            f"🚨 <b>VMc1 BUY SIGNAL — ${row['ticker']}</b>\n"
+            f"🚨 <b>VMc1 BUY SIGNAL — ${ticker}</b>  {badge}\n"
             f"<i>{row['company']}</i>\n\n"
-            f"<b>Insider Context</b>\n"
+            f"<b>Insider Context</b> ({conviction} buy event{'s' if conviction > 1 else ''})\n"
             f"  👤 {row['insider_name']} [{row['insider_role']}]\n"
             f"  💰 {row['shares']:,.0f} sh @ ${row['buy_price']:.2f} "
             f"(${row['value']:,.0f}) on {row['txn_date']}\n"
-            f"  📅 Signal fired {days_since}d after filing\n\n"
+            f"  📅 Signal fired {days_since}d after filing\n"
+            f"{micro_note}\n"
             f"<b>Confirmations ✅ 4/4</b>\n"
-            f"  📈 ${sig['price']:.2f} vs insider ${row['buy_price']:.2f} ({upside_pct:+.1f}%) ✅\n"
+            f"  📈 ${sig['price']:.2f} vs insider ${row['buy_price']:.2f} "
+            f"({upside_pct:+.1f}%) ✅\n"
             f"  📊 RSI {sig['rsi']} > {RSI_MIN} ✅\n"
             f"  〰️ Price > 20 EMA (${sig['ema20']:.2f}) ✅\n"
             f"  🔊 Volume {vol_ratio:.1f}x avg ✅\n\n"
@@ -581,35 +671,48 @@ def run_watchlist_check():
         )
         send_telegram(msg)
 
-        # Paperclip CEO task
-        paperclip_ok = notify_paperclip_ceo(row, sig)
-        log.info(f"SIGNAL FIRED: {row['ticker']} | Paperclip: {'OK' if paperclip_ok else 'FAILED'}")
+        paperclip_ok = notify_paperclip_ceo(ticker, ticker_signals,
+                                            {"avg_volume": sig["avg_volume"]})
+        log.info(
+            f"SIGNAL FIRED: ${ticker} conviction={conviction} "
+            f"| Paperclip: {'OK' if paperclip_ok else 'FAILED'}"
+        )
 
     # ── Partial signals digest ────────────────────────────────────────────────
-    if partial:
+    if partial_by_ticker:
         lines = ["👀 <b>VMc1 Watchlist — Near Signals</b>", ""]
-        for row, sig, n in sorted(partial, key=lambda x: -x[2]):
-            vol_ratio = sig["volume"] / max(sig["avg_volume"], 1)
-            sanity = ""
+        for ticker, (row, sig, n) in sorted(
+            partial_by_ticker.items(), key=lambda x: -x[1][2]
+        ):
+            vol_ratio  = sig["volume"] / max(sig["avg_volume"], 1)
+            moved_pct  = sig["already_moved"] * 100
+            sanity     = ""
             if not sig["sane_price"]:
                 sanity += " ⚠️ price data error"
             if not sig["liquid"]:
                 sanity += " ⚠️ illiquid"
+            if not sig["not_chasing"]:
+                sanity += f" ⚠️ chasing (+{moved_pct:.0f}%)"
             checks = (
                 f"{'✅' if sig['price_reclaim'] else '❌'} price "
                 f"{'✅' if sig['rsi_ok'] else '❌'} RSI={sig['rsi']} "
                 f"{'✅' if sig['ema_ok'] else '❌'} EMA "
                 f"{'✅' if sig['vol_ok'] else '❌'} vol{sanity}"
             )
+            conviction = db_get_conviction_score(ticker)
+            conv_badge = " 🔴" if conviction >= 3 else " 🔶" if conviction == 2 else ""
             lines.append(
-                f"<b>${row['ticker']}</b> {n}/4\n"
+                f"<b>${ticker}</b>{conv_badge} {n}/7\n"
                 f"  {checks}\n"
                 f"  Price ${sig['price']:.2f} | Insider ${row['buy_price']:.2f} | "
-                f"Vol {vol_ratio:.1f}x"
+                f"Vol {vol_ratio:.1f}x | +{moved_pct:.1f}%"
             )
         send_telegram("\n".join(lines))
 
-    log.info(f"=== Watchlist check complete: {len(signals_fired)} signals fired ===")
+    log.info(
+        f"=== Watchlist check complete: {len(signals_by_ticker)} "
+        f"tickers fired signals ==="
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -622,15 +725,17 @@ def main():
     send_telegram(
         "✅ <b>SEC Form 4 Scanner</b> online\n"
         "📋 Watchlist monitor active\n"
-        "🤖 VMc1 Paperclip integration enabled"
+        "🤖 VMc1 Paperclip integration enabled\n"
+        "⚡ Intraday scan added (17:00 CET)"
     )
 
-    schedule.every().day.at("06:00").do(run_scan)
+    schedule.every().day.at("06:00").do(lambda: run_scan("morning"))
+    schedule.every().day.at("17:00").do(lambda: run_scan("intraday"))
     schedule.every().day.at("21:00").do(run_watchlist_check)
-    log.info("Scheduled: scan @ 06:00 CET | watchlist check @ 21:00 CET")
+    log.info("Scheduled: scan @ 06:00 + 17:00 CET | watchlist check @ 21:00 CET")
 
     log.info("Running initial scan now...")
-    run_scan()
+    run_scan("startup")
 
     while True:
         schedule.run_pending()
