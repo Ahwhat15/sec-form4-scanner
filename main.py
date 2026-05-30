@@ -26,20 +26,21 @@ WATCHLIST_EXPIRY_DAYS     = 30
 
 # ── Signal thresholds ─────────────────────────────────────────────────────────
 RSI_PERIOD          = 14
-RSI_MIN             = 50
 EMA_PERIOD          = 20
-VOLUME_MULTIPLIER_STANDARD  = 1.1   # Tier 2: single buy, <$1M, INS role
-VOLUME_MULTIPLIER_HIGH      = 0.0   # Tier 1: CEO/DIR multi-buy or >$1M — no vol requirement
-MAX_INSIDER_PRICE   = 500       # filter data errors (e.g. $1191 instead of $1.191)
-MIN_AVG_DAILY_VOL   = 100_000   # shares — filter illiquid tickers
-MAX_ABOVE_INSIDER   = 0.25      # skip if price already >25% above insider buy price
-MAX_TXN_AGE_DAYS    = 30        # skip transactions older than 30 days (late amendments)
+RSI_MIN             = 45        # momentum positive
+RSI_MAX             = 70        # not overbought — blocks exhausted moves
+MAX_ABOVE_INSIDER   = 0.08      # within 8% of insider buy price
+MAX_FILING_AGE_DAYS = 5         # fresh filing — within 5 trading days
+MIN_INSIDER_QUALITY = 500_000   # DIR/OFF or transaction >= $500k
+MAX_INSIDER_PRICE   = 500       # filter data errors
+MIN_AVG_DAILY_VOL   = 100_000   # filter illiquid tickers
+MAX_TXN_AGE_DAYS    = 30        # skip transactions older than 30 days
+MICRO_CAP_VOL_MAX   = 300_000   # flag micro-cap momentum
 FUND_KEYWORDS       = {         # skip self-purchases by funds/ETFs
     "fund", "trust", "etf", "inc.", "lp", "llc", "management",
     "capital", "asset", "partners", "investments", "advisors",
     "group", "global", "corp.", "s.a.", "limited",
 }
-MICRO_CAP_VOL_MAX   = 300_000   # flag as micro-cap momentum if avg vol below this
 
 # ── EDGAR ─────────────────────────────────────────────────────────────────────
 EDGAR_HEADERS = {"User-Agent": "VMc1Investments scanner@vmc1.no"}
@@ -276,7 +277,7 @@ Average daily volume is {avg_vol_k:.0f}k shares (below {MICRO_CAP_VOL_MAX/1000:.
 
 ### Technical Confirmations (4/4) ✅
 - Price ${sig['price']:.2f} > Highest insider buy ${row['buy_price']:.2f} ({upside_pct:+.1f}%) ✅
-- RSI {sig['rsi']} > {RSI_MIN} ✅
+- RSI {sig['rsi']} in range {RSI_MIN}–{RSI_MAX} ✅
 - Price > 20 EMA (${sig['ema20']:.2f}) ✅
 - Volume {vol_ratio:.1f}x above 20-day average ✅
 - Avg daily volume: {avg_vol_k:.0f}k shares
@@ -376,35 +377,37 @@ def fetch_market_data(ticker: str) -> dict | None:
         return None
 
 
-def check_signal(data: dict, insider_buy_price: float, conviction: int = 1, is_director: bool = False, value: float = 0) -> dict:
+def check_signal(data: dict, insider_buy_price: float, conviction: int = 1,
+                 is_director: bool = False, value: float = 0,
+                 filed_date: str = "") -> dict:
+    """High-probability signal: quality over quantity."""
     already_moved = (data["price"] - insider_buy_price) / max(insider_buy_price, 0.01)
-    price_reclaim = data["price"] > insider_buy_price
-    not_chasing   = already_moved <= MAX_ABOVE_INSIDER
-    rsi_ok        = data["rsi"] > RSI_MIN
-    ema_ok        = data["price"] > data["ema20"]
-    sane_price    = insider_buy_price <= MAX_INSIDER_PRICE
-    liquid        = data["avg_volume"] >= MIN_AVG_DAILY_VOL
+    filing_age    = get_filing_age_trading_days(filed_date)
+    high_quality  = is_director or value >= MIN_INSIDER_QUALITY
 
-    # Tier 1: director or multi-buy or >$1M — no volume requirement
-    # Tier 2: standard — need 1.1x average volume
-    high_conviction = is_director or conviction >= 2 or value >= 1_000_000
-    if high_conviction:
-        vol_ok = True   # volume not required for high conviction
-    else:
-        vol_ok = data["volume"] > data["avg_volume"] * VOLUME_MULTIPLIER_STANDARD
+    price_reclaim  = data["price"] > insider_buy_price
+    close_to_entry = already_moved <= MAX_ABOVE_INSIDER
+    rsi_ok         = RSI_MIN <= data["rsi"] <= RSI_MAX
+    ema_ok         = data["price"] > data["ema20"]
+    fresh_filing   = filing_age <= MAX_FILING_AGE_DAYS
+    quality_ok     = high_quality
+    sane_price     = insider_buy_price <= MAX_INSIDER_PRICE
+    liquid         = data["avg_volume"] >= MIN_AVG_DAILY_VOL
 
     return {
-        "signal":        all([price_reclaim, not_chasing, rsi_ok, ema_ok,
-                              vol_ok, sane_price, liquid]),
-        "high_conviction": high_conviction,
+        "signal":        all([price_reclaim, close_to_entry, rsi_ok, ema_ok,
+                              fresh_filing, quality_ok, sane_price, liquid]),
+        "high_quality":  high_quality,
         "price_reclaim": price_reclaim,
-        "not_chasing":   not_chasing,
+        "close_to_entry": close_to_entry,
         "rsi_ok":        rsi_ok,
         "ema_ok":        ema_ok,
-        "vol_ok":        vol_ok,
+        "fresh_filing":  fresh_filing,
+        "quality_ok":    quality_ok,
         "sane_price":    sane_price,
         "liquid":        liquid,
         "already_moved": already_moved,
+        "filing_age":    filing_age,
         "price":         data["price"],
         "rsi":           round(data["rsi"], 1),
         "ema20":         round(data["ema20"], 2),
@@ -489,6 +492,24 @@ def is_stale_transaction(txn_date: str, max_days: int = MAX_TXN_AGE_DAYS) -> boo
         return age > max_days
     except Exception:
         return False
+
+
+def get_filing_age_trading_days(filed_date: str) -> int:
+    """Approximate trading days since filing date, skipping weekends."""
+    if not filed_date:
+        return 999
+    try:
+        filed_dt = datetime.strptime(filed_date[:10], "%Y-%m-%d").replace(tzinfo=CET)
+        now      = datetime.now(CET)
+        days     = 0
+        current  = filed_dt
+        while current.date() < now.date():
+            current += timedelta(days=1)
+            if current.weekday() < 5:
+                days += 1
+        return days
+    except Exception:
+        return 999
 
 
 def parse_form4_xml(accession: str, company_cik: str,
@@ -683,16 +704,16 @@ def run_spot_check():
             sig           = check_signal(data, row["buy_price"],
                                           conviction=len(rows),
                                           is_director=(row["insider_role"] == "DIR"),
-                                          value=row["value"])
-            confirmations = sum([sig["price_reclaim"], sig["not_chasing"],
-                                 sig["rsi_ok"], sig["ema_ok"],
-                                 sig["vol_ok"], sig["sane_price"], sig["liquid"]])
-            tier = "T1" if sig["high_conviction"] else "T2"
+                                          value=row["value"],
+                                          filed_date=row["filed_date"])
+            confirmations = sum([sig["price_reclaim"], sig["close_to_entry"],
+                                 sig["rsi_ok"], sig["ema_ok"], sig["fresh_filing"],
+                                 sig["quality_ok"], sig["sane_price"], sig["liquid"]])
             log.info(
-                f"  [spot] {ticker} [{tier}]: price={data['price']:.2f} "
+                f"  [spot] {ticker}: price={data['price']:.2f} "
                 f"insider={row['buy_price']:.2f} RSI={sig['rsi']} "
-                f"vol={data['volume']/max(data['avg_volume'],1):.1f}x "
-                f"confirms={confirmations}/7"
+                f"moved={sig['already_moved']*100:.1f}% age={sig['filing_age']}d "
+                f"confirms={confirmations}/8"
             )
             if sig["signal"]:
                 ticker_signals.append((row, sig))
@@ -744,11 +765,13 @@ def run_spot_check():
             parts.append(micro_note)
         parts += [
             "",
-            "<b>Confirmations ✅ 4/4</b>",
+            "<b>Signal Checks ✅ 8/8</b>",
             f"  📈 ${sig['price']:.2f} vs insider ${row['buy_price']:.2f} ({upside_pct:+.1f}%) ✅",
-            f"  📊 RSI {sig['rsi']} > {RSI_MIN} ✅",
+            f"  🎯 Within {MAX_ABOVE_INSIDER*100:.0f}% of insider price ✅",
+            f"  📊 RSI {sig['rsi']} ({RSI_MIN}–{RSI_MAX} range) ✅",
             f"  〰️ Price > 20 EMA (${sig['ema20']:.2f}) ✅",
-            f"  🔊 Volume {vol_ratio:.1f}x avg ✅",
+            f"  ⏱ Filing age: {sig['filing_age']} trading days ✅",
+            f"  ✔️ Quality insider (DIR/OFF or ≥$500k) ✅",
             "",
             "<i>⚡ Same-day signal — 🤖 VMc1 agents briefed</i>",
         ]
@@ -804,23 +827,21 @@ def run_watchlist_check():
             sig           = check_signal(data, row["buy_price"],
                                           conviction=len(rows),
                                           is_director=(row["insider_role"] == "DIR"),
-                                          value=row["value"])
-            confirmations = sum([sig["price_reclaim"], sig["not_chasing"],
-                                 sig["rsi_ok"], sig["ema_ok"],
-                                 sig["vol_ok"], sig["sane_price"], sig["liquid"]])
-            tier = "T1" if sig["high_conviction"] else "T2"
-
+                                          value=row["value"],
+                                          filed_date=row["filed_date"])
+            confirmations = sum([sig["price_reclaim"], sig["close_to_entry"],
+                                 sig["rsi_ok"], sig["ema_ok"], sig["fresh_filing"],
+                                 sig["quality_ok"], sig["sane_price"], sig["liquid"]])
             log.info(
-                f"  {ticker} [{tier}]: price={data['price']:.2f} insider={row['buy_price']:.2f} "
-                f"RSI={sig['rsi']} EMA={sig['ema20']} "
-                f"vol={data['volume']/max(data['avg_volume'],1):.1f}x "
-                f"moved={sig['already_moved']*100:.1f}% confirms={confirmations}/7"
+                f"  {ticker}: price={data['price']:.2f} insider={row['buy_price']:.2f} "
+                f"RSI={sig['rsi']} moved={sig['already_moved']*100:.1f}% "
+                f"age={sig['filing_age']}d confirms={confirmations}/8"
             )
 
             if sig["signal"]:
                 ticker_signals.append((row, sig))
                 db_mark_alerted(row["id"])
-            elif confirmations >= 3:
+            elif confirmations >= 6:
                 if best_partial is None or confirmations > best_partial[2]:
                     best_partial = (row, sig, confirmations)
 
@@ -900,9 +921,10 @@ def run_watchlist_check():
                 sanity += f" ⚠️ chasing (+{moved_pct:.0f}%)"
             checks = (
                 f"{'✅' if sig['price_reclaim'] else '❌'} price "
+                f"{'✅' if sig['close_to_entry'] else '❌'} entry(+{sig['already_moved']*100:.0f}%) "
                 f"{'✅' if sig['rsi_ok'] else '❌'} RSI={sig['rsi']} "
                 f"{'✅' if sig['ema_ok'] else '❌'} EMA "
-                f"{'✅' if sig['vol_ok'] else '❌'} vol{sanity}"
+                f"{'✅' if sig['fresh_filing'] else '❌'} age={sig['filing_age']}d"
             )
             conviction = db_get_conviction_score(ticker)
             conv_badge = " 💎" if (conviction >= 3 and row["value"] >= 1_000_000 and row["insider_role"] == "DIR") else " 🔥" if conviction >= 3 else " 🟠" if conviction == 2 else " 🔺" if (row["insider_role"] == "DIR" or row["value"] >= 1_000_000) else " 🔵"
