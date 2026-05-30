@@ -213,16 +213,28 @@ def notify_paperclip_ceo(ticker: str, signals: list[tuple], market_data: dict) -
     is_micro_cap    = sig["avg_volume"] < MICRO_CAP_VOL_MAX
     avg_vol_k       = sig["avg_volume"] / 1000
 
-    # Conviction label
-    if conviction >= 3:
-        conviction_label = "🔴 HIGH CONVICTION — 3+ separate buy events"
-        strategy_note   = "Multi-day accumulation pattern detected. Weight position sizing accordingly."
+    # Conviction label — 5 unique tiers
+    is_elite = conviction >= 3 and value >= 1_000_000 and row.get("insider_role") == "DIR"
+    if is_elite:
+        conviction_label = "💎 ELITE — 3+ buys, DIR, ≥$1M"
+        strategy_note   = "Highest conviction signal. Director accumulating heavily at scale."
+        position_size   = 200
+    elif conviction >= 3:
+        conviction_label = "🔥 HIGH — 3+ separate buy events"
+        strategy_note   = "Multi-day accumulation pattern. Strong insider intent."
+        position_size   = 200
     elif conviction == 2:
-        conviction_label = "🔶 ELEVATED CONVICTION — 2 separate buy events"
-        strategy_note   = "Repeated buying suggests insider confidence. Standard VMc1 position sizing."
+        conviction_label = "🟠 ELEVATED — 2 separate buy events"
+        strategy_note   = "Repeated buying confirms insider confidence."
+        position_size   = 175
+    elif row.get("insider_role") == "DIR" or value >= 1_000_000:
+        conviction_label = "🔺 STANDARD T1 — DIR/CEO or ≥$1M single buy"
+        strategy_note   = "Director or large single buy. Volume requirement waived."
+        position_size   = 150
     else:
-        conviction_label = "🟡 STANDARD — single buy event"
-        strategy_note   = "Single insider buy. Apply standard VMc1 rules."
+        conviction_label = "🔵 STANDARD T2 — single INS buy, vol confirmed"
+        strategy_note   = "Single insider buy with volume confirmation."
+        position_size   = 100
 
     # Micro-cap flag
     micro_cap_note = ""
@@ -246,7 +258,7 @@ Average daily volume is {avg_vol_k:.0f}k shares (below {MICRO_CAP_VOL_MAX/1000:.
         for r, _ in sorted(signals, key=lambda x: x[0]["txn_date"] or "")
     ])
 
-    task_title = f"[INSIDER SIGNAL] ${ticker} — {conviction_label}"
+    task_title = f"[INSIDER SIGNAL] ${ticker} — {conviction_label} | ${position_size} position"
 
     task_body = f"""## VMc1 Insider Flow Signal — Action Required
 
@@ -283,7 +295,7 @@ Average daily volume is {avg_vol_k:.0f}k shares (below {MICRO_CAP_VOL_MAX/1000:.
 
 2. **Backtest Agent** — Run insider-buy + 4-confirmation strategy on ${ticker} historically. Report win rate, avg return, max drawdown.
 
-3. **Risk Management Agent** — Size position per VMc1 rules. {'$100 max for micro-cap momentum.' if is_micro_cap else '$200 standard position.'} Stop = 2% below ${row['buy_price']:.2f}. Target = 3:1 R:R. Approve or reject.
+3. **Risk Management Agent** — Suggested position: **${position_size}** based on conviction tier. {'$100 max for micro-cap momentum — override conviction sizing.' if is_micro_cap else ''} Stop = below ${row['buy_price']:.2f} (insider buy price). Target = 3:1 R:R. Approve or reject.
 
 4. **Execution Agent** — If Risk approves, place paper trade on Alpaca. Report entry, stop, target, size.
 
@@ -702,12 +714,17 @@ def run_spot_check():
         upside_pct = ((sig["price"] - row["buy_price"]) / row["buy_price"]) * 100
         is_micro   = sig["avg_volume"] < MICRO_CAP_VOL_MAX
 
-        if conviction >= 3:
-            badge = "🔴 HIGH CONVICTION"
+        is_elite = conviction >= 3 and row["value"] >= 1_000_000 and row["insider_role"] == "DIR"
+        if is_elite:
+            badge = "💎 ELITE"
+        elif conviction >= 3:
+            badge = "🔥 HIGH"
         elif conviction == 2:
-            badge = "🔶 ELEVATED CONVICTION"
+            badge = "🟠 ELEVATED"
+        elif row["insider_role"] == "DIR" or row["value"] >= 1_000_000:
+            badge = "🔺 STANDARD T1"
         else:
-            badge = "🟡 STANDARD"
+            badge = "🔵 STANDARD T2"
 
         if is_micro:
             micro_note = "\n  ⚠️ <b>MICRO-CAP MOMENTUM</b> — max $100, exit within 5 days"
@@ -824,13 +841,18 @@ def run_watchlist_check():
                        datetime.fromisoformat(row["added_at"])).days
         is_micro    = sig["avg_volume"] < MICRO_CAP_VOL_MAX
 
-        # Conviction badge
-        if conviction >= 3:
-            badge = "🔴 HIGH CONVICTION"
+        # Conviction badge — 5 unique tiers
+        is_elite = conviction >= 3 and row["value"] >= 1_000_000 and row["insider_role"] == "DIR"
+        if is_elite:
+            badge = "💎 ELITE"
+        elif conviction >= 3:
+            badge = "🔥 HIGH"
         elif conviction == 2:
-            badge = "🔶 ELEVATED CONVICTION"
+            badge = "🟠 ELEVATED"
+        elif row["insider_role"] == "DIR" or row["value"] >= 1_000_000:
+            badge = "🔺 STANDARD T1"
         else:
-            badge = "🟡 STANDARD"
+            badge = "🔵 STANDARD T2"
 
         micro_note = "\n  ⚠️ <b>MICRO-CAP MOMENTUM</b> — max $100, exit within 5 days" \
                      if is_micro else ""
@@ -883,7 +905,7 @@ def run_watchlist_check():
                 f"{'✅' if sig['vol_ok'] else '❌'} vol{sanity}"
             )
             conviction = db_get_conviction_score(ticker)
-            conv_badge = " 🔴" if conviction >= 3 else " 🔶" if conviction == 2 else ""
+            conv_badge = " 💎" if (conviction >= 3 and row["value"] >= 1_000_000 and row["insider_role"] == "DIR") else " 🔥" if conviction >= 3 else " 🟠" if conviction == 2 else " 🔺" if (row["insider_role"] == "DIR" or row["value"] >= 1_000_000) else " 🔵"
             lines.append(
                 f"<b>${ticker}</b>{conv_badge} {n}/7\n"
                 f"  {checks}\n"
