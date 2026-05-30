@@ -51,7 +51,7 @@ DB_PATH = "/data/watchlist.db"
 
 # ── Paperclip VMc1 ────────────────────────────────────────────────────────────
 PAPERCLIP_BASE_URL = os.environ.get("PAPERCLIP_BASE_URL", "")
-PAPERCLIP_JWT      = os.environ.get("PAPERCLIP_JWT_SECRET", "")
+PAPERCLIP_CEO_API_KEY = os.environ.get("PAPERCLIP_CEO_API_KEY", "")
 VMC1_COMPANY_ID    = "dc2df96a-a846-4634-a9a0-24e593916c75"
 VMC1_CEO_AGENT_ID  = "3db60f1f-86fd-461e-a7bd-96392fa2c893"
 
@@ -200,7 +200,7 @@ def notify_paperclip_ceo(ticker: str, signals: list[tuple], market_data: dict) -
     Create ONE task per ticker per run, consolidating all watchlist entries.
     Includes conviction score and micro-cap flag in the briefing.
     """
-    if not PAPERCLIP_BASE_URL or not PAPERCLIP_JWT:
+    if not PAPERCLIP_BASE_URL or not PAPERCLIP_CEO_API_KEY:
         log.warning("Paperclip env vars not set — skipping CEO notification")
         return False
 
@@ -305,13 +305,13 @@ This is a paper trade — no real capital at risk.
 
     url     = f"{PAPERCLIP_BASE_URL}/api/companies/{VMC1_COMPANY_ID}/issues"
     headers = {
-        "Authorization": f"Bearer {PAPERCLIP_JWT}",
+        "Authorization": f"Bearer {PAPERCLIP_CEO_API_KEY}",
         "Content-Type":  "application/json",
     }
     payload = {
         "title":       task_title,
         "description": task_body,
-        "assigneeId":  VMC1_CEO_AGENT_ID,
+        "assigneeAgentId": VMC1_CEO_AGENT_ID,
         "priority":    "urgent",
         "status":      "todo",
     }
