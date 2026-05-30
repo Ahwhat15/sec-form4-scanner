@@ -792,15 +792,15 @@ def run_spot_check():
 # WATCHLIST SIGNAL CHECK  (21:00 CET daily)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def run_watchlist_check():
+def run_watchlist_check(label: str = "close"):
     now = datetime.now(CET)
     if now.weekday() >= 5:
-        log.info("Weekend — skipping watchlist check")
+        log.info(f"Weekend — skipping {label} watchlist check")
         return
 
     db_expire_old()
     active = db_get_active()
-    log.info(f"=== Watchlist check: {len(active)} active positions ===")
+    log.info(f"=== Watchlist check [{label}]: {len(active)} active positions ===")
 
     if not active:
         log.info("Watchlist empty — nothing to check")
@@ -953,14 +953,16 @@ def main():
         "✅ <b>SEC Form 4 Scanner</b> online\n"
         "📋 Watchlist monitor active\n"
         "🤖 VMc1 Paperclip integration enabled\n"
-        "⚡ Intraday scan + spot check (17:00 / 17:05 CET)"
+        "⚡ Intraday scan + spot check (17:00 / 17:05 CET)\n"
+        "📊 Watchlist checks: 08:00 pre-market + 21:00 close"
     )
 
     schedule.every().day.at("06:00").do(lambda: run_scan("morning"))
+    schedule.every().day.at("08:00").do(lambda: run_watchlist_check("pre-market"))
     schedule.every().day.at("17:00").do(lambda: run_scan("intraday"))
     schedule.every().day.at("17:05").do(run_spot_check)
-    schedule.every().day.at("21:00").do(run_watchlist_check)
-    log.info("Scheduled: scan @ 06:00 + 17:00 CET | spot check @ 17:05 | watchlist check @ 21:00 CET")
+    schedule.every().day.at("21:00").do(lambda: run_watchlist_check("close"))
+    log.info("Scheduled: scan @ 06:00 + 17:00 CET | watchlist @ 08:00 + 21:00 CET | spot check @ 17:05 CET")
 
     log.info("Running initial scan now...")
     run_scan("startup")
