@@ -7,6 +7,9 @@ import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 import schedule
+import asyncio as _asyncio
+from outcome_logger import get_logger as _get_ol
+_ol = _get_ol()
 
 logging.basicConfig(
     level=logging.INFO,
@@ -614,6 +617,7 @@ def run_scan(label: str = "morning"):
         accession, company_cik, xml_filename, src = parse_filing_meta(hit)
         if not accession or accession in seen_accessions:
             continue
+<<<<<<< Updated upstream
         seen_accessions.add(accession)
         file_type = src.get("file_type", "")
         if file_type not in ("4", "") and not file_type.startswith("4"):
@@ -664,6 +668,24 @@ def run_scan(label: str = "morning"):
 
     send_telegram("\n".join(lines))
     log.info(f"=== {label} scan complete ===")
+=======
+        parsed = parse_form4_xml(xml_str)
+        qualifying.extend(parsed)
+        time.sleep(0.15)
+    log.info("Qualifying purchases: %d", len(qualifying))
+    msg = format_message(qualifying, start, end)
+    send_telegram(msg)
+    async def _log():
+        for f in qualifying:
+            await _ol.log_signal(
+                symbol=f["ticker"], signal_type="sec_form4_insider_buy",
+                trade_taken=False, score=min(float(f["value"])/100000, 10.0),
+                signal_detail={"owner": f["owner"], "role": f["role"], "value": f["value"], "shares": f["shares"]},
+            )
+        await _ol.close()
+    _asyncio.run(_log())
+    log.info("=== Scan complete ===")
+>>>>>>> Stashed changes
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
