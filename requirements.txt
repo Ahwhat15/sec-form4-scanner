@@ -1,3 +1,4 @@
 requests
 schedule
 yfinance
+aiohttp>=3.9.0
