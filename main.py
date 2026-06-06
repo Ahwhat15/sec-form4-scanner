@@ -6,7 +6,6 @@ import requests
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
-import schedule
 import asyncio as _asyncio
 from outcome_logger import get_logger as _get_ol
 _ol = _get_ol()
@@ -26,6 +25,58 @@ CET = ZoneInfo("Europe/Oslo")
 MIN_TRANSACTION_VALUE     = 100_000
 INCLUDE_TRANSACTION_CODES = {"P"}
 WATCHLIST_EXPIRY_DAYS     = 30
+
+# ── Catalyst scanner ──────────────────────────────────────────────────────────
+# SIC codes for pharma / biotech / medtech — only these sectors get 8-K scanned
+BIOTECH_SICS = {
+    "2833", "2834", "2835", "2836",          # pharmaceuticals
+    "2860", "2861", "2865", "2869",          # industrial chemicals / biotech
+    "3841", "3842", "3843", "3844", "3845",  # medical devices
+    "5047",                                  # medical equipment wholesale
+    "8011", "8049", "8071", "8099",          # health services
+    "8731",                                  # commercial physical research
+}
+
+# 8-K item numbers that indicate regulatory/corporate events worth scanning
+CATALYST_ITEMS = {"8.01", "7.01"}
+
+# FDA keyword patterns — phrases only, no ambiguous abbreviations
+# Each tuple: (search_phrase, display_label)
+FDA_KEYWORDS = [
+    # Drug applications — phrase match only to avoid "NDA" = non-disclosure agreement
+    ("new drug application",         "NDA"),
+    ("biologics license application", "BLA"),
+    ("supplemental new drug",        "sNDA"),
+    ("supplemental biologics",       "sBLA"),
+    ("premarket approval",           "PMA"),
+    ("510(k)",                       "510(k)"),
+    # Regulatory milestones
+    ("PDUFA",                        "PDUFA date"),
+    ("prescription drug user fee",   "PDUFA"),
+    ("complete response letter",     "CRL"),
+    ("resubmission",                 "resubmission"),
+    ("resubmit",                     "resubmit"),
+    ("clinical hold",                "clinical hold"),
+    ("partial clinical hold",        "partial clinical hold"),
+    # Positive designations
+    ("breakthrough therapy",         "breakthrough therapy"),
+    ("fast track designation",       "fast track"),
+    ("priority review",              "priority review"),
+    ("accelerated approval",         "accelerated approval"),
+    ("orphan drug designation",      "orphan drug"),
+    # FDA actions
+    ("fda approval",                 "FDA approval"),
+    ("fda approved",                 "FDA approved"),
+    ("fda clearance",                "FDA clearance"),
+    ("fda granted",                  "FDA granted"),
+    ("fda accepted",                 "FDA accepted"),
+    ("fda rejected",                 "FDA rejected"),
+    ("fda issued",                   "FDA issued"),
+    ("advisory committee",           "AdCom"),
+]
+
+# Insider buy lookback for standalone catalyst alerts (days)
+CATALYST_INSIDER_LOOKBACK = 90
 
 # ── Signal thresholds ─────────────────────────────────────────────────────────
 RSI_PERIOD          = 14
@@ -91,6 +142,21 @@ def db_init():
         conn.execute("""
             CREATE UNIQUE INDEX IF NOT EXISTS idx_watchlist_ticker_date
             ON watchlist(ticker, txn_date)
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS catalyst_watchlist (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                ticker       TEXT NOT NULL,
+                company      TEXT,
+                cik          TEXT,
+                event_type   TEXT,
+                event_desc   TEXT,
+                filed_date   TEXT NOT NULL,
+                accession    TEXT UNIQUE,
+                insider_buy  INTEGER DEFAULT 0,
+                alerted      INTEGER DEFAULT 0,
+                added_at     TEXT NOT NULL
+            )
         """)
     log.info("DB initialised")
 
@@ -390,17 +456,26 @@ def check_signal(data: dict, insider_buy_price: float, conviction: int = 1,
 
     price_reclaim  = data["price"] > insider_buy_price
     close_to_entry = already_moved <= MAX_ABOVE_INSIDER
-    rsi_ok         = RSI_MIN <= data["rsi"] <= RSI_MAX
     ema_ok         = data["price"] > data["ema20"]
     fresh_filing   = filing_age <= MAX_FILING_AGE_DAYS
     quality_ok     = high_quality
     sane_price     = insider_buy_price <= MAX_INSIDER_PRICE
     liquid         = data["avg_volume"] >= MIN_AVG_DAILY_VOL
 
+    # CEO/large buy RSI override:
+    # If Director AND total value >= $5M, waive RSI floor only
+    # Insider conviction at this scale overrides short-term momentum weakness
+    ceo_large_buy = is_director and value >= 5_000_000
+    if ceo_large_buy:
+        rsi_ok = data["rsi"] <= RSI_MAX   # ceiling only — no floor
+    else:
+        rsi_ok = RSI_MIN <= data["rsi"] <= RSI_MAX
+
     return {
         "signal":        all([price_reclaim, close_to_entry, rsi_ok, ema_ok,
                               fresh_filing, quality_ok, sane_price, liquid]),
         "high_quality":  high_quality,
+        "ceo_large_buy": ceo_large_buy,
         "price_reclaim": price_reclaim,
         "close_to_entry": close_to_entry,
         "rsi_ok":        rsi_ok,
@@ -585,6 +660,290 @@ def parse_form4_xml(accession: str, company_cik: str,
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# CATALYST SCANNER  (8-K regulatory events + insider cross-reference)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def fetch_8k_filings(start_date: str, end_date: str) -> list[dict]:
+    """Fetch 8-K filings from biotech/pharma SIC codes only."""
+    all_hits  = []
+    offset    = 0
+    total_exp = None
+
+    while True:
+        params = {
+            "forms":     "8-K",
+            "dateRange": "custom",
+            "startdt":   start_date,
+            "enddt":     end_date,
+            "from":      offset,
+        }
+        try:
+            r = requests.get(EFTS_URL, params=params, headers=EDGAR_HEADERS, timeout=30)
+            r.raise_for_status()
+            data = r.json()
+        except Exception as e:
+            log.error(f"8-K EFTS request failed at offset {offset}: {e}")
+            break
+
+        hits_obj = data.get("hits", {})
+        if total_exp is None:
+            t         = hits_obj.get("total", {})
+            total_exp = t.get("value", 0) if isinstance(t, dict) else int(t or 0)
+            log.info(f"8-K total filings in range: {total_exp}")
+
+        batch = hits_obj.get("hits", [])
+        if not batch:
+            break
+
+        # Filter to biotech/pharma SIC codes before adding
+        for hit in batch:
+            src  = hit.get("_source", {})
+            sics = src.get("sics", [])
+            if any(s in BIOTECH_SICS for s in sics):
+                all_hits.append(hit)
+
+        offset += len(batch)
+        if offset >= total_exp or offset >= 10_000:
+            break
+        time.sleep(0.35)
+
+    log.info(f"8-K filings in biotech/pharma SICs: {len(all_hits)}")
+    return all_hits
+
+
+def fetch_8k_text(accession: str, company_cik: str, filename: str) -> str:
+    """Fetch the text content of an 8-K document."""
+    if not filename or not filename.lower().endswith(".htm"):
+        return ""
+    acc_nodash = accession.replace("-", "")
+    url = (f"https://www.sec.gov/Archives/edgar/data/"
+           f"{company_cik}/{acc_nodash}/{filename}")
+    try:
+        r = requests.get(url, headers=EDGAR_HEADERS, timeout=20)
+        if r.status_code != 200:
+            return ""
+        # Strip HTML tags for keyword search
+        text = r.text
+        import re
+        text = re.sub(r"<[^>]+>", " ", text)
+        return text[:50_000]  # first 50k chars is enough
+    except Exception as e:
+        log.debug(f"8-K text fetch failed {accession}: {e}")
+        return ""
+
+
+def detect_fda_event(text: str) -> tuple[bool, str]:
+    """
+    Check if 8-K text contains FDA regulatory phrases.
+    Uses phrase matching only — avoids false positives from
+    abbreviations like NDA (non-disclosure agreement).
+    Returns (is_fda_event, event_description).
+    """
+    if not text:
+        return False, ""
+
+    text_lower = text.lower()
+    found_labels = []
+
+    for phrase, label in FDA_KEYWORDS:
+        if phrase.lower() in text_lower:
+            if label not in found_labels:
+                found_labels.append(label)
+
+    if not found_labels:
+        return False, ""
+
+    return True, ", ".join(found_labels[:5])
+
+
+def get_insider_buys_for_cik(cik: str) -> list[dict]:
+    """Check if we have recent insider buys for this CIK in the watchlist."""
+    cutoff = (datetime.now(CET) - timedelta(days=CATALYST_INSIDER_LOOKBACK)).strftime("%Y-%m-%d")
+    with db_connect() as conn:
+        rows = conn.execute("""
+            SELECT ticker, insider_name, insider_role, buy_price, value, txn_date
+            FROM watchlist
+            WHERE added_at >= ?
+            ORDER BY value DESC
+        """, (cutoff,)).fetchall()
+    # We don't store CIK in watchlist — match by ticker lookup if needed
+    # Return all recent buys for caller to cross-reference by ticker
+    return [dict(r) for r in rows]
+
+
+def db_add_catalyst(ticker: str, company: str, cik: str,
+                    event_desc: str, filed_date: str,
+                    accession: str, has_insider: bool):
+    try:
+        with db_connect() as conn:
+            conn.execute("""
+                INSERT OR IGNORE INTO catalyst_watchlist
+                (ticker, company, cik, event_type, event_desc, filed_date,
+                 accession, insider_buy, alerted, added_at)
+                VALUES (?,?,?,?,?,?,?,?,0,?)
+            """, (
+                ticker, company, cik,
+                "FDA_REGULATORY",
+                event_desc,
+                filed_date,
+                accession,
+                1 if has_insider else 0,
+                datetime.now(CET).isoformat(),
+            ))
+    except Exception as e:
+        log.warning(f"Catalyst DB insert failed {ticker}: {e}")
+
+
+def run_catalyst_scan(label: str = "morning"):
+    """
+    Scan 8-K filings from biotech/pharma companies for FDA regulatory events.
+    Cross-references with insider watchlist for convergence signals.
+    """
+    now = datetime.now(CET)
+    if now.weekday() >= 5:
+        log.info(f"Weekend — skipping catalyst scan")
+        return
+
+    log.info(f"=== Catalyst 8-K scan starting ({label}) ===")
+    end_date   = now.strftime("%Y-%m-%d")
+    start_date = (now - timedelta(days=1)).strftime("%Y-%m-%d")
+
+    hits = fetch_8k_filings(start_date, end_date)
+    if not hits:
+        log.info("No biotech/pharma 8-K filings found")
+        return
+
+    # Get current insider watchlist tickers for cross-reference
+    recent_insider_tickers = set()
+    cutoff = (now - timedelta(days=CATALYST_INSIDER_LOOKBACK)).strftime("%Y-%m-%d")
+    with db_connect() as conn:
+        rows = conn.execute(
+            "SELECT DISTINCT ticker FROM watchlist WHERE added_at >= ?", (cutoff,)
+        ).fetchall()
+    recent_insider_tickers = {r[0] for r in rows}
+
+    fda_events      = []
+    convergence     = []  # FDA event + insider buy overlap
+    seen_accessions = set()
+
+    for hit in hits:
+        src       = hit.get("_source", {})
+        hit_id    = hit.get("_id", "")
+        accession = src.get("adsh") or (hit_id.split(":")[0] if ":" in hit_id else hit_id)
+        filename  = hit_id.split(":")[1] if ":" in hit_id else ""
+        ciks      = src.get("ciks", [])
+        company_cik = ciks[-1].lstrip("0") if ciks else ""
+        items     = src.get("items", [])
+
+        if accession in seen_accessions:
+            continue
+        seen_accessions.add(accession)
+
+        # Quick filter: only process items 8.01 and 7.01
+        if not any(item in CATALYST_ITEMS for item in items):
+            continue
+
+        # Get ticker from display_names
+        display = src.get("display_names", [""])
+        ticker  = ""
+        company = ""
+        if display:
+            # Format: "Company Name  (TICK)  (CIK 0001234)"
+            import re
+            match = re.search(r'\(([A-Z]{1,5})(?:,|\s|\))', display[0])
+            if match:
+                ticker = match.group(1)
+            company = display[0].split("  (")[0] if "  (" in display[0] else display[0]
+
+        # Fetch and check document text for FDA keywords
+        text = fetch_8k_text(accession, company_cik, filename)
+        is_fda, event_desc = detect_fda_event(text)
+
+        if not is_fda:
+            continue
+
+        has_insider = ticker in recent_insider_tickers
+        db_add_catalyst(ticker, company, company_cik,
+                        event_desc, src.get("file_date", end_date),
+                        accession, has_insider)
+
+        entry = {
+            "ticker":      ticker,
+            "company":     company,
+            "event_desc":  event_desc,
+            "filed_date":  src.get("file_date", end_date),
+            "has_insider": has_insider,
+            "items":       items,
+        }
+        fda_events.append(entry)
+        if has_insider:
+            convergence.append(entry)
+
+        time.sleep(0.15)
+
+    log.info(f"FDA 8-K events found: {len(fda_events)} "
+             f"({len(convergence)} with insider convergence)")
+
+    # ── Send convergence alerts first (highest priority) ──────────────────────
+    for e in convergence:
+        # Get insider detail from watchlist
+        with db_connect() as conn:
+            ins_rows = conn.execute(
+                "SELECT insider_name, insider_role, buy_price, value, txn_date "
+                "FROM watchlist WHERE ticker = ? AND alerted = 0 "
+                "ORDER BY value DESC LIMIT 1",
+                (e["ticker"],)
+            ).fetchone()
+
+        insider_line = ""
+        if ins_rows:
+            ins = dict(ins_rows)
+            insider_line = (
+                f"\n<b>Insider Buy on Watchlist</b>\n"
+                f"  👤 {ins['insider_name']} [{ins['insider_role']}]\n"
+                f"  💰 {ins['value']:,.0f} shares @ ${ins['buy_price']:.2f} on {ins['txn_date']}"
+            )
+
+        msg = (
+            f"🔬 <b>VMc1 CATALYST CONVERGENCE — ${e['ticker']}</b>\n"
+            f"<i>{e['company']}</i>\n\n"
+            f"<b>FDA Regulatory Event</b>\n"
+            f"  📋 Keywords: {e['event_desc']}\n"
+            f"  📅 Filed: {e['filed_date']}\n"
+            f"  📄 Items: {', '.join(e['items'])}"
+            f"{insider_line}\n\n"
+            f"<i>⚠️ Verify the 8-K content before acting — "
+            f"could be approval, rejection, or routine update</i>"
+        )
+        send_telegram(msg)
+        log.info(f"CONVERGENCE ALERT: ${e['ticker']} — {e['event_desc']}")
+
+    # ── Send standalone FDA events digest ─────────────────────────────────────
+    standalone = [e for e in fda_events if not e["has_insider"]]
+    if standalone:
+        lines = [
+            f"🧬 <b>FDA Regulatory Events ({label})</b>",
+            f"<i>{start_date} — {len(standalone)} events, no insider overlap</i>",
+            "<i>Monitoring only — no insider buying detected</i>",
+            "",
+        ]
+        for e in standalone[:10]:
+            lines.append(
+                f"<b>${e['ticker']}</b> {e['company'][:30]}\n"
+                f"  📋 {e['event_desc']} | Items: {', '.join(e['items'])}"
+            )
+        if len(standalone) > 10:
+            lines.append(f"\n<i>… and {len(standalone) - 10} more</i>")
+        msg = "\n".join(lines)
+        # Telegram limit is 4096 chars — truncate if needed
+        if len(msg) > 4000:
+            msg = msg[:4000] + "\n\n<i>... truncated — too many near signals</i>"
+        send_telegram(msg)
+
+    log.info(f"=== Catalyst scan complete ===")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # SCAN JOBS  (06:00 and 17:00 CET)
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -666,7 +1025,6 @@ def run_scan(label: str = "morning"):
         lines.append(f"\n<i>… and {len(qualifying) - 15} more</i>")
 
     send_telegram("\n".join(lines))
-    import asyncio as _asyncio
     async def _log():
         for t in qualifying:
             await _ol.log_signal(
@@ -724,7 +1082,7 @@ def run_spot_check():
                                  sig["quality_ok"], sig["sane_price"], sig["liquid"]])
             log.info(
                 f"  [spot] {ticker}: price={data['price']:.2f} "
-                f"insider={row['buy_price']:.2f} RSI={sig['rsi']} "
+                f"insider={row['buy_price']:.2f} RSI={sig['rsi']}{'*' if sig.get('ceo_large_buy') else ''} "
                 f"moved={sig['already_moved']*100:.1f}% age={sig['filing_age']}d "
                 f"confirms={confirmations}/8"
             )
@@ -765,6 +1123,26 @@ def run_spot_check():
         else:
             micro_note = ""
 
+        # Trade levels
+        entry     = sig["price"]
+        stop      = round(row["buy_price"] * 0.98, 2)
+        risk      = max(entry - stop, 0.01)
+        t1        = round(entry + risk * 1.5, 2)
+        t2        = round(entry + risk * 3.0, 2)
+        t3        = round(entry + risk * 5.0, 2)
+
+        if badge in ("💎 ELITE", "🔥 HIGH"):
+            pos_size = 200
+        elif badge == "🟠 ELEVATED":
+            pos_size = 175
+        elif badge == "🔺 STANDARD T1":
+            pos_size = 150
+        else:
+            pos_size = 100
+        if is_micro:
+            pos_size = min(pos_size, 100)
+        shares_to_buy = int(pos_size / entry) if entry > 0 else 0
+
         parts = [
             f"⚡ <b>VMc1 INTRADAY SIGNAL — ${ticker}</b>  {badge}",
             f"<i>{row['company']}</i>",
@@ -780,23 +1158,30 @@ def run_spot_check():
             "",
             "<b>Signal Checks ✅ 8/8</b>",
             f"  📈 ${sig['price']:.2f} vs insider ${row['buy_price']:.2f} ({upside_pct:+.1f}%) ✅",
-            f"  🎯 Within {MAX_ABOVE_INSIDER*100:.0f}% of insider price ✅",
-            f"  📊 RSI {sig['rsi']} ({RSI_MIN}–{RSI_MAX} range) ✅",
-            f"  〰️ Price > 20 EMA (${sig['ema20']:.2f}) ✅",
-            f"  ⏱ Filing age: {sig['filing_age']} trading days ✅",
-            f"  ✔️ Quality insider (DIR/OFF or ≥$500k) ✅",
+            f"  📊 RSI {sig['rsi']} ({RSI_MIN}–{RSI_MAX}) ✅",
+            f"  〰️ Above 20 EMA (${sig['ema20']:.2f}) ✅",
+            f"  ⏱ Filing age: {sig['filing_age']}d ✅",
+            "",
+            "<b>Trade Levels</b>",
+            f"  🟢 Entry:  ${entry:.2f}  ({shares_to_buy} sh · ${pos_size} position)",
+            f"  🔴 Stop:   ${stop:.2f}  (2% below insider ${row['buy_price']:.2f})",
+            f"  🎯 T1:     ${t1:.2f}  (1.5R — sell ⅓, stop → breakeven)",
+            f"  🎯 T2:     ${t2:.2f}  (3.0R — sell ⅓, trail rest)",
+            f"  🎯 T3:     ${t3:.2f}  (5.0R — close last ⅓)",
+            f"  ⚖️ Risk: ${risk:.2f}/sh · R:R to T2 = 3:1",
             "",
             "<i>⚡ Same-day signal — 🤖 VMc1 agents briefed</i>",
         ]
         msg = "\n".join(parts)
         send_telegram(msg)
 
-        paperclip_ok = notify_paperclip_ceo(ticker, ticker_signals,
-                                            {"avg_volume": sig["avg_volume"]})
-        log.info(
-            f"SPOT SIGNAL: ${ticker} conviction={conviction} "
-            f"| Paperclip: {'OK' if paperclip_ok else 'FAILED'}"
-        )
+        # Only wake CEO agent for Elite signals
+        if badge == "💎 ELITE":
+            paperclip_ok = notify_paperclip_ceo(ticker, ticker_signals,
+                                                {"avg_volume": sig["avg_volume"]})
+            log.info(f"SPOT SIGNAL: ${ticker} {badge} | Paperclip: {'OK' if paperclip_ok else 'FAILED'}")
+        else:
+            log.info(f"SPOT SIGNAL: ${ticker} {badge} | Paperclip: skipped (not Elite)")
 
     log.info(f"=== Spot check complete: {len(signals_by_ticker)} signals fired ===")
 
@@ -891,31 +1276,65 @@ def run_watchlist_check(label: str = "close"):
         micro_note = "\n  ⚠️ <b>MICRO-CAP MOMENTUM</b> — max $100, exit within 5 days" \
                      if is_micro else ""
 
-        msg = (
-            f"🚨 <b>VMc1 BUY SIGNAL — ${ticker}</b>  {badge}\n"
-            f"<i>{row['company']}</i>\n\n"
-            f"<b>Insider Context</b> ({conviction} buy event{'s' if conviction > 1 else ''})\n"
-            f"  👤 {row['insider_name']} [{row['insider_role']}]\n"
-            f"  💰 {row['shares']:,.0f} sh @ ${row['buy_price']:.2f} "
-            f"(${row['value']:,.0f}) on {row['txn_date']}\n"
-            f"  📅 Signal fired {days_since}d after filing\n"
-            f"{micro_note}\n"
-            f"<b>Confirmations ✅ 4/4</b>\n"
-            f"  📈 ${sig['price']:.2f} vs insider ${row['buy_price']:.2f} "
-            f"({upside_pct:+.1f}%) ✅\n"
-            f"  📊 RSI {sig['rsi']} > {RSI_MIN} ✅\n"
-            f"  〰️ Price > 20 EMA (${sig['ema20']:.2f}) ✅\n"
-            f"  🔊 Volume {vol_ratio:.1f}x avg ✅\n\n"
-            f"<i>🤖 VMc1 agents briefed — Research → Risk → Execution underway</i>"
-        )
+        # Trade levels
+        entry     = sig["price"]
+        stop      = round(row["buy_price"] * 0.98, 2)
+        risk      = max(entry - stop, 0.01)
+        t1        = round(entry + risk * 1.5, 2)
+        t2        = round(entry + risk * 3.0, 2)
+        t3        = round(entry + risk * 5.0, 2)
+
+        if badge in ("💎 ELITE", "🔥 HIGH"):
+            pos_size = 200
+        elif badge == "🟠 ELEVATED":
+            pos_size = 175
+        elif badge == "🔺 STANDARD T1":
+            pos_size = 150
+        else:
+            pos_size = 100
+        if is_micro:
+            pos_size = min(pos_size, 100)
+        shares_to_buy = int(pos_size / entry) if entry > 0 else 0
+
+        lines = [
+            f"🚨 <b>VMc1 BUY SIGNAL — ${ticker}</b>  {badge}",
+            f"<i>{row['company']}</i>",
+            "",
+            f"<b>Insider Context</b> ({conviction} buy event{'s' if conviction > 1 else ''})",
+            f"  👤 {row['insider_name']} [{row['insider_role']}]",
+            f"  💰 {row['shares']:,.0f} sh @ ${row['buy_price']:.2f} (${row['value']:,.0f}) on {row['txn_date']}",
+            f"  📅 Signal fired {days_since}d after filing",
+        ]
+        if micro_note:
+            lines.append(micro_note)
+        lines += [
+            "",
+            "<b>Signal Checks ✅ 8/8</b>",
+            f"  📈 ${sig['price']:.2f} vs insider ${row['buy_price']:.2f} ({upside_pct:+.1f}%) ✅",
+            f"  📊 RSI {sig['rsi']} ({RSI_MIN}–{RSI_MAX}) ✅",
+            f"  〰️ Above 20 EMA (${sig['ema20']:.2f}) ✅",
+            f"  ⏱ Filing age: {sig['filing_age']}d ✅",
+            "",
+            "<b>Trade Levels</b>",
+            f"  🟢 Entry:  ${entry:.2f}  ({shares_to_buy} sh · ${pos_size} position)",
+            f"  🔴 Stop:   ${stop:.2f}  (2% below insider ${row['buy_price']:.2f})",
+            f"  🎯 T1:     ${t1:.2f}  (1.5R — sell ⅓, stop → breakeven)",
+            f"  🎯 T2:     ${t2:.2f}  (3.0R — sell ⅓, trail rest)",
+            f"  🎯 T3:     ${t3:.2f}  (5.0R — close last ⅓)",
+            f"  ⚖️ Risk: ${risk:.2f}/sh · R:R to T2 = 3:1",
+            "",
+            "<i>🤖 VMc1 agents briefed — Research → Risk → Execution underway</i>" if badge == "💎 ELITE" else "<i>📋 Review manually — Paperclip reserved for 💎 Elite signals</i>",
+        ]
+        msg = "\n".join(lines)
         send_telegram(msg)
 
-        paperclip_ok = notify_paperclip_ceo(ticker, ticker_signals,
-                                            {"avg_volume": sig["avg_volume"]})
-        log.info(
-            f"SIGNAL FIRED: ${ticker} conviction={conviction} "
-            f"| Paperclip: {'OK' if paperclip_ok else 'FAILED'}"
-        )
+        # Only wake CEO agent for Elite signals — controls Anthropic costs
+        if badge == "💎 ELITE":
+            paperclip_ok = notify_paperclip_ceo(ticker, ticker_signals,
+                                                {"avg_volume": sig["avg_volume"]})
+            log.info(f"SIGNAL FIRED: ${ticker} {badge} | Paperclip: {'OK' if paperclip_ok else 'FAILED'}")
+        else:
+            log.info(f"SIGNAL FIRED: ${ticker} {badge} | Paperclip: skipped (not Elite)")
 
     # ── Partial signals digest ────────────────────────────────────────────────
     if partial_by_ticker:
@@ -930,12 +1349,12 @@ def run_watchlist_check(label: str = "close"):
                 sanity += " ⚠️ price data error"
             if not sig["liquid"]:
                 sanity += " ⚠️ illiquid"
-            if not sig["not_chasing"]:
+            if not sig["close_to_entry"]:
                 sanity += f" ⚠️ chasing (+{moved_pct:.0f}%)"
             checks = (
                 f"{'✅' if sig['price_reclaim'] else '❌'} price "
                 f"{'✅' if sig['close_to_entry'] else '❌'} entry(+{sig['already_moved']*100:.0f}%) "
-                f"{'✅' if sig['rsi_ok'] else '❌'} RSI={sig['rsi']} "
+                f"{'✅' if sig['rsi_ok'] else '❌'} RSI={sig['rsi']}{'*' if sig.get('ceo_large_buy') else ''} "
                 f"{'✅' if sig['ema_ok'] else '❌'} EMA "
                 f"{'✅' if sig['fresh_filing'] else '❌'} age={sig['filing_age']}d"
             )
@@ -959,6 +1378,19 @@ def run_watchlist_check(label: str = "close"):
 # MAIN
 # ═══════════════════════════════════════════════════════════════════════════════
 
+# ── Schedule definition (all times in CET/CEST — DST handled automatically) ──
+# Each entry: (hour, minute, job_function, label)
+SCHEDULE = [
+    (6,  0,  lambda: run_scan("morning"),            "morning scan"),
+    (6,  15, lambda: run_catalyst_scan("morning"),   "morning catalyst"),
+    (15, 0,  lambda: run_watchlist_check("pre-market"), "pre-market watchlist"),
+    (17, 0,  lambda: run_scan("intraday"),           "intraday scan"),
+    (17, 5,  run_spot_check,                         "spot check"),
+    (17, 15, lambda: run_catalyst_scan("intraday"),  "intraday catalyst"),
+    (21, 0,  lambda: run_watchlist_check("close"),   "close watchlist"),
+]
+
+
 def main():
     db_init()
     log.info("SEC Form 4 Scanner + Watchlist Monitor starting up")
@@ -967,21 +1399,35 @@ def main():
         "📋 Watchlist monitor active\n"
         "🤖 VMc1 Paperclip integration enabled\n"
         "⚡ Intraday scan + spot check (17:00 / 17:05 CET)\n"
-        "📊 Watchlist checks: 08:00 pre-market + 21:00 close"
+        "📊 Watchlist checks: 15:00 pre-market + 21:00 close\n"
+        "🕐 All times CET/CEST — DST aware"
     )
 
-    schedule.every().day.at("06:00").do(lambda: run_scan("morning"))
-    schedule.every().day.at("08:00").do(lambda: run_watchlist_check("pre-market"))
-    schedule.every().day.at("17:00").do(lambda: run_scan("intraday"))
-    schedule.every().day.at("17:05").do(run_spot_check)
-    schedule.every().day.at("21:00").do(lambda: run_watchlist_check("close"))
-    log.info("Scheduled: scan @ 06:00 + 17:00 CET | watchlist @ 08:00 + 21:00 CET | spot check @ 17:05 CET")
+    log.info(
+        "Scheduled (CET/CEST): scan 06:00+17:00 | catalyst 06:15+17:15 | "
+        "watchlist 15:00+21:00 | spot 17:05"
+    )
 
     log.info("Running initial scan now...")
     run_scan("startup")
 
+    # Track which jobs have already run today to avoid double-firing
+    last_run: dict[str, str] = {}  # label → date string
+
     while True:
-        schedule.run_pending()
+        now  = datetime.now(CET)
+        date = now.strftime("%Y-%m-%d")
+        hm   = (now.hour, now.minute)
+
+        for hour, minute, job, label in SCHEDULE:
+            if hm == (hour, minute) and last_run.get(label) != date:
+                last_run[label] = date
+                try:
+                    log.info(f"Triggering: {label}")
+                    job()
+                except Exception as e:
+                    log.error(f"Job failed [{label}]: {e}", exc_info=True)
+
         time.sleep(30)
 
 
