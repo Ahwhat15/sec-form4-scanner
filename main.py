@@ -6,9 +6,6 @@ import requests
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
-import asyncio as _asyncio
-from outcome_logger import get_logger as _get_ol
-_ol = _get_ol()
 
 logging.basicConfig(
     level=logging.INFO,
@@ -1025,15 +1022,6 @@ def run_scan(label: str = "morning"):
         lines.append(f"\n<i>… and {len(qualifying) - 15} more</i>")
 
     send_telegram("\n".join(lines))
-    async def _log():
-        for t in qualifying:
-            await _ol.log_signal(
-                symbol=t["ticker"], signal_type="sec_form4_insider_buy",
-                trade_taken=False, score=min(float(t["value"])/100000, 10.0),
-                signal_detail={"owner": t["name"], "value": t["value"], "shares": t["shares"]},
-            )
-        await _ol.close()
-    _asyncio.run(_log())
     log.info(f"=== {label} scan complete ===")
 
 
@@ -1070,12 +1058,13 @@ def run_spot_check():
         if not data:
             continue
 
+        total_value = sum(r["value"] for r in rows)
         ticker_signals = []
         for row in rows:
             sig           = check_signal(data, row["buy_price"],
                                           conviction=len(rows),
                                           is_director=(row["insider_role"] == "DIR"),
-                                          value=row["value"],
+                                          value=total_value,
                                           filed_date=row["filed_date"])
             confirmations = sum([sig["price_reclaim"], sig["close_to_entry"],
                                  sig["rsi_ok"], sig["ema_ok"], sig["fresh_filing"],
