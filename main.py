@@ -85,7 +85,7 @@ MAX_FILING_AGE_DAYS = 5         # fresh filing — within 5 trading days
 MIN_INSIDER_QUALITY = 500_000   # DIR/OFF or transaction >= $500k
 MAX_INSIDER_PRICE   = 500       # filter data errors
 MIN_AVG_DAILY_VOL   = 100_000   # filter illiquid tickers
-MAX_TRANSACTION_VALUE = 500_000_000  # filter data errors (e.g. $3.5B SVRE)
+MAX_TRANSACTION_VALUE = 50_000_000   # filter data errors (e.g. $307M SVRE)
 MAX_TXN_AGE_DAYS    = 30        # skip transactions older than 30 days
 MICRO_CAP_VOL_MAX   = 300_000   # flag micro-cap momentum
 FUND_KEYWORDS       = {         # skip self-purchases by funds/ETFs
@@ -639,7 +639,14 @@ def parse_form4_xml(accession: str, company_cik: str,
         if value < MIN_TRANSACTION_VALUE:
             continue
         if value > MAX_TRANSACTION_VALUE:
-            log.debug(f"Skipping implausible transaction value ${value:,.0f} for {issuer_ticker}")
+            log.info(f"Filtered large transaction: ${issuer_ticker} ${value:,.0f} (exceeds ${MAX_TRANSACTION_VALUE:,.0f} cap)")
+            send_telegram(
+                f"⚠️ <b>Large Transaction Filtered</b>\n"
+                f"  ${issuer_ticker} — {issuer_name}\n"
+                f"  💰 {shares:,.0f} sh @ ${price:.2f} = <b>${value:,.0f}</b>\n"
+                f"  📅 {txn_date_val}\n"
+                f"  <i>Exceeded ${MAX_TRANSACTION_VALUE:,.0f} cap — verify manually</i>"
+            )
             continue
         txn_date_val = txt(txn, "transactionDate/value")
         if is_stale_transaction(txn_date_val):
