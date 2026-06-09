@@ -85,6 +85,7 @@ MAX_FILING_AGE_DAYS = 5         # fresh filing — within 5 trading days
 MIN_INSIDER_QUALITY = 500_000   # DIR/OFF or transaction >= $500k
 MAX_INSIDER_PRICE   = 500       # filter data errors
 MIN_AVG_DAILY_VOL   = 100_000   # filter illiquid tickers
+MAX_TRANSACTION_VALUE = 500_000_000  # filter data errors (e.g. $3.5B SVRE)
 MAX_TXN_AGE_DAYS    = 30        # skip transactions older than 30 days
 MICRO_CAP_VOL_MAX   = 300_000   # flag micro-cap momentum
 FUND_KEYWORDS       = {         # skip self-purchases by funds/ETFs
@@ -636,6 +637,9 @@ def parse_form4_xml(accession: str, company_cik: str,
         except ValueError:
             continue
         if value < MIN_TRANSACTION_VALUE:
+            continue
+        if value > MAX_TRANSACTION_VALUE:
+            log.debug(f"Skipping implausible transaction value ${value:,.0f} for {issuer_ticker}")
             continue
         txn_date_val = txt(txn, "transactionDate/value")
         if is_stale_transaction(txn_date_val):
