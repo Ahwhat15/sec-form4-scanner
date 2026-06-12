@@ -235,6 +235,32 @@ def db_get_conviction_score(ticker: str) -> int:
         ).fetchone()[0]
 
 
+def db_get_ticker_history(ticker: str, lookback_days: int = WATCHLIST_EXPIRY_DAYS) -> dict:
+    """
+    Aggregate insider buy history for a ticker within the lookback window,
+    regardless of whether individual rows have already been alerted.
+
+    This reflects the INSIDER'S sustained buying behaviour over time —
+    not just which rows happen to be unalerted on tonight's run.
+    Used for conviction tier / Elite determination.
+    """
+    cutoff = (datetime.now(CET) - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
+    with db_connect() as conn:
+        row = conn.execute("""
+            SELECT
+                COUNT(*)                                  AS event_count,
+                COALESCE(SUM(value), 0)                   AS total_value,
+                MAX(CASE WHEN insider_role = 'DIR' THEN 1 ELSE 0 END) AS has_dir
+            FROM watchlist
+            WHERE ticker = ? AND filed_date >= ?
+        """, (ticker, cutoff)).fetchone()
+    return {
+        "event_count": row["event_count"] or 0,
+        "total_value": row["total_value"] or 0,
+        "has_dir":     bool(row["has_dir"]),
+    }
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # TELEGRAM
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1101,12 +1127,16 @@ def run_spot_check():
     # Send alerts — same format as full watchlist check
     for ticker, ticker_signals in signals_by_ticker.items():
         row, sig   = max(ticker_signals, key=lambda x: x[0]["value"])
-        conviction = len(ticker_signals)
+        history    = db_get_ticker_history(ticker)
+        conviction = history["event_count"]
+        agg_value  = history["total_value"]
+        has_dir    = history["has_dir"]
+
         vol_ratio  = sig["volume"] / max(sig["avg_volume"], 1)
         upside_pct = ((sig["price"] - row["buy_price"]) / row["buy_price"]) * 100
         is_micro   = sig["avg_volume"] < MICRO_CAP_VOL_MAX
 
-        is_elite = conviction >= 3 and row["value"] >= 1_000_000 and row["insider_role"] == "DIR"
+        is_elite = conviction >= 3 and agg_value >= 1_000_000 and has_dir
         if is_elite:
             badge = "💎 ELITE"
         elif conviction >= 3:
@@ -1218,6 +1248,7 @@ def run_watchlist_check(label: str = "close"):
             log.debug(f"No market data for {ticker}")
             continue
 
+        total_value    = sum(r["value"] for r in rows)
         ticker_signals = []
         best_partial   = None
 
@@ -1225,7 +1256,7 @@ def run_watchlist_check(label: str = "close"):
             sig           = check_signal(data, row["buy_price"],
                                           conviction=len(rows),
                                           is_director=(row["insider_role"] == "DIR"),
-                                          value=row["value"],
+                                          value=total_value,
                                           filed_date=row["filed_date"])
             confirmations = sum([sig["price_reclaim"], sig["close_to_entry"],
                                  sig["rsi_ok"], sig["ema_ok"], sig["fresh_filing"],
@@ -1253,7 +1284,13 @@ def run_watchlist_check(label: str = "close"):
     # ── Full signals — one Telegram + one Paperclip task per ticker ───────────
     for ticker, ticker_signals in signals_by_ticker.items():
         row, sig    = max(ticker_signals, key=lambda x: x[0]["value"])
-        conviction  = len(ticker_signals)
+        # Conviction reflects the INSIDER'S total buying history for this
+        # ticker within the lookback window — not just rows unalerted tonight.
+        history     = db_get_ticker_history(ticker)
+        conviction  = history["event_count"]
+        agg_value   = history["total_value"]
+        has_dir     = history["has_dir"]
+
         vol_ratio   = sig["volume"] / max(sig["avg_volume"], 1)
         upside_pct  = ((sig["price"] - row["buy_price"]) / row["buy_price"]) * 100
         days_since  = (datetime.now(CET) -
@@ -1261,7 +1298,7 @@ def run_watchlist_check(label: str = "close"):
         is_micro    = sig["avg_volume"] < MICRO_CAP_VOL_MAX
 
         # Conviction badge — 5 unique tiers
-        is_elite = conviction >= 3 and row["value"] >= 1_000_000 and row["insider_role"] == "DIR"
+        is_elite = conviction >= 3 and agg_value >= 1_000_000 and has_dir
         if is_elite:
             badge = "💎 ELITE"
         elif conviction >= 3:
@@ -1358,8 +1395,11 @@ def run_watchlist_check(label: str = "close"):
                 f"{'✅' if sig['ema_ok'] else '❌'} EMA "
                 f"{'✅' if sig['fresh_filing'] else '❌'} age={sig['filing_age']}d"
             )
-            conviction = db_get_conviction_score(ticker)
-            conv_badge = " 💎" if (conviction >= 3 and row["value"] >= 1_000_000 and row["insider_role"] == "DIR") else " 🔥" if conviction >= 3 else " 🟠" if conviction == 2 else " 🔺" if (row["insider_role"] == "DIR" or row["value"] >= 1_000_000) else " 🔵"
+            history    = db_get_ticker_history(ticker)
+            conviction = history["event_count"]
+            agg_value  = history["total_value"]
+            has_dir    = history["has_dir"]
+            conv_badge = " 💎" if (conviction >= 3 and agg_value >= 1_000_000 and has_dir) else " 🔥" if conviction >= 3 else " 🟠" if conviction == 2 else " 🔺" if (row["insider_role"] == "DIR" or row["value"] >= 1_000_000) else " 🔵"
             lines.append(
                 f"<b>${ticker}</b>{conv_badge} {n}/7\n"
                 f"  {checks}\n"
