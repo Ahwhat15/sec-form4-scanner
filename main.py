@@ -1173,9 +1173,10 @@ def run_spot_check():
             pos_size = min(pos_size, 100)
         shares_to_buy = int(pos_size / entry) if entry > 0 else 0
 
+        company_safe = row['company'].replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
         parts = [
             f"⚡ <b>VMc1 INTRADAY SIGNAL — ${ticker}</b>  {badge}",
-            f"<i>{row['company']}</i>",
+            f"<i>{company_safe}</i>",
             "<i>Filed today — market still open</i>",
             "",
             f"<b>Insider Context</b>",
@@ -1333,9 +1334,10 @@ def run_watchlist_check(label: str = "close"):
             pos_size = min(pos_size, 100)
         shares_to_buy = int(pos_size / entry) if entry > 0 else 0
 
+        company_safe = row['company'].replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
         lines = [
             f"🚨 <b>VMc1 BUY SIGNAL — ${ticker}</b>  {badge}",
-            f"<i>{row['company']}</i>",
+            f"<i>{company_safe}</i>",
             "",
             f"<b>Insider Context</b> ({conviction} buy event{'s' if conviction > 1 else ''})",
             f"  👤 {row['insider_name']} [{row['insider_role']}]",
