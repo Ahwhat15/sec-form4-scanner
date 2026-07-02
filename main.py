@@ -4,6 +4,7 @@ import sqlite3
 import logging
 import requests
 import xml.etree.ElementTree as ET
+from html import escape
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -308,7 +309,9 @@ def notify_paperclip_ceo(ticker: str, signals: list[tuple], market_data: dict) -
     avg_vol_k       = sig["avg_volume"] / 1000
 
     # Conviction label — 5 unique tiers
-    is_elite = conviction >= 3 and value >= 1_000_000 and row.get("insider_role") == "DIR"
+    agg_value  = sum(r["value"] for r, _ in signals)
+    has_dir_pc = any(r.get("insider_role") == "DIR" for r, _ in signals)
+    is_elite = conviction >= 3 and agg_value >= 1_000_000 and has_dir_pc
     if is_elite:
         conviction_label = "💎 ELITE — 3+ buys, DIR, ≥$1M"
         strategy_note   = "Highest conviction signal. Director accumulating heavily at scale."
@@ -321,7 +324,7 @@ def notify_paperclip_ceo(ticker: str, signals: list[tuple], market_data: dict) -
         conviction_label = "🟠 ELEVATED — 2 separate buy events"
         strategy_note   = "Repeated buying confirms insider confidence."
         position_size   = 175
-    elif row.get("insider_role") == "DIR" or value >= 1_000_000:
+    elif row.get("insider_role") == "DIR" or agg_value >= 1_000_000:
         conviction_label = "🔺 STANDARD T1 — DIR/CEO or ≥$1M single buy"
         strategy_note   = "Director or large single buy. Volume requirement waived."
         position_size   = 150
@@ -495,9 +498,12 @@ def check_signal(data: dict, insider_buy_price: float, conviction: int = 1,
     else:
         rsi_ok = RSI_MIN <= data["rsi"] <= RSI_MAX
 
+    # Volume confirmation: today's volume >= average daily volume
+    volume_ok = data["volume"] >= data["avg_volume"]
+
     return {
         "signal":        all([price_reclaim, close_to_entry, rsi_ok, ema_ok,
-                              fresh_filing, quality_ok, sane_price, liquid]),
+                              fresh_filing, quality_ok, sane_price, liquid, volume_ok]),
         "high_quality":  high_quality,
         "ceo_large_buy": ceo_large_buy,
         "price_reclaim": price_reclaim,
@@ -508,6 +514,7 @@ def check_signal(data: dict, insider_buy_price: float, conviction: int = 1,
         "quality_ok":    quality_ok,
         "sane_price":    sane_price,
         "liquid":        liquid,
+        "volume_ok":     volume_ok,
         "already_moved": already_moved,
         "filing_age":    filing_age,
         "price":         data["price"],
@@ -669,7 +676,7 @@ def parse_form4_xml(accession: str, company_cik: str,
             log.info(f"Filtered large transaction: ${issuer_ticker} ${value:,.0f} (exceeds ${MAX_TRANSACTION_VALUE:,.0f} cap)")
             send_telegram(
                 f"⚠️ <b>Large Transaction Filtered</b>\n"
-                f"  ${issuer_ticker} — {issuer_name}\n"
+                f"  ${escape(issuer_ticker)} — {escape(issuer_name)}\n"
                 f"  💰 {shares:,.0f} sh @ ${price:.2f} = <b>${value:,.0f}</b>\n"
                 f"  📅 {txn_date_val}\n"
                 f"  <i>Exceeded ${MAX_TRANSACTION_VALUE:,.0f} cap — verify manually</i>"
@@ -1173,10 +1180,9 @@ def run_spot_check():
             pos_size = min(pos_size, 100)
         shares_to_buy = int(pos_size / entry) if entry > 0 else 0
 
-        company_safe = row['company'].replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
         parts = [
             f"⚡ <b>VMc1 INTRADAY SIGNAL — ${ticker}</b>  {badge}",
-            f"<i>{company_safe}</i>",
+            f"<i>{row['company']}</i>",
             "<i>Filed today — market still open</i>",
             "",
             f"<b>Insider Context</b>",
@@ -1187,11 +1193,12 @@ def run_spot_check():
             parts.append(micro_note)
         parts += [
             "",
-            "<b>Signal Checks ✅ 8/8</b>",
+            "<b>Signal Checks ✅ 9/9</b>",
             f"  📈 ${sig['price']:.2f} vs insider ${row['buy_price']:.2f} ({upside_pct:+.1f}%) ✅",
             f"  📊 RSI {sig['rsi']} ({RSI_MIN}–{RSI_MAX}) ✅",
             f"  〰️ Above 20 EMA (${sig['ema20']:.2f}) ✅",
             f"  ⏱ Filing age: {sig['filing_age']}d ✅",
+            f"  🔊 Volume {'✅' if sig['volume_ok'] else '❌'} ({sig['volume']/max(sig['avg_volume'],1):.1f}x avg)",
             "",
             "<b>Trade Levels</b>",
             f"  🟢 Entry:  ${entry:.2f}  ({shares_to_buy} sh · ${pos_size} position)",
@@ -1334,10 +1341,9 @@ def run_watchlist_check(label: str = "close"):
             pos_size = min(pos_size, 100)
         shares_to_buy = int(pos_size / entry) if entry > 0 else 0
 
-        company_safe = row['company'].replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
         lines = [
             f"🚨 <b>VMc1 BUY SIGNAL — ${ticker}</b>  {badge}",
-            f"<i>{company_safe}</i>",
+            f"<i>{row['company']}</i>",
             "",
             f"<b>Insider Context</b> ({conviction} buy event{'s' if conviction > 1 else ''})",
             f"  👤 {row['insider_name']} [{row['insider_role']}]",
@@ -1348,11 +1354,12 @@ def run_watchlist_check(label: str = "close"):
             lines.append(micro_note)
         lines += [
             "",
-            "<b>Signal Checks ✅ 8/8</b>",
+            "<b>Signal Checks ✅ 9/9</b>",
             f"  📈 ${sig['price']:.2f} vs insider ${row['buy_price']:.2f} ({upside_pct:+.1f}%) ✅",
             f"  📊 RSI {sig['rsi']} ({RSI_MIN}–{RSI_MAX}) ✅",
             f"  〰️ Above 20 EMA (${sig['ema20']:.2f}) ✅",
             f"  ⏱ Filing age: {sig['filing_age']}d ✅",
+            f"  🔊 Volume {'✅' if sig['volume_ok'] else '❌'} ({sig['volume']/max(sig['avg_volume'],1):.1f}x avg)",
             "",
             "<b>Trade Levels</b>",
             f"  🟢 Entry:  ${entry:.2f}  ({shares_to_buy} sh · ${pos_size} position)",
@@ -1403,7 +1410,7 @@ def run_watchlist_check(label: str = "close"):
             has_dir    = history["has_dir"]
             conv_badge = " 💎" if (conviction >= 3 and agg_value >= 1_000_000 and has_dir) else " 🔥" if conviction >= 3 else " 🟠" if conviction == 2 else " 🔺" if (row["insider_role"] == "DIR" or row["value"] >= 1_000_000) else " 🔵"
             lines.append(
-                f"<b>${ticker}</b>{conv_badge} {n}/7\n"
+                f"<b>${ticker}</b>{conv_badge} {n}/9\n"
                 f"  {checks}\n"
                 f"  Price ${sig['price']:.2f} | Insider ${row['buy_price']:.2f} | "
                 f"Vol {vol_ratio:.1f}x | +{moved_pct:.1f}%"
