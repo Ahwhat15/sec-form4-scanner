@@ -1409,9 +1409,10 @@ def run_watchlist_check(label: str = "close"):
             agg_value  = history["total_value"]
             has_dir    = history["has_dir"]
             conv_badge = " 💎" if (conviction >= 3 and agg_value >= 1_000_000 and has_dir) else " 🔥" if conviction >= 3 else " 🟠" if conviction == 2 else " 🔺" if (row["insider_role"] == "DIR" or row["value"] >= 1_000_000) else " 🔵"
+            safe_checks = checks.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
             lines.append(
                 f"<b>${ticker}</b>{conv_badge} {n}/9\n"
-                f"  {checks}\n"
+                f"  {safe_checks}\n"
                 f"  Price ${sig['price']:.2f} | Insider ${row['buy_price']:.2f} | "
                 f"Vol {vol_ratio:.1f}x | +{moved_pct:.1f}%"
             )
