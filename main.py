@@ -1,3 +1,4 @@
+
 import os
 import time
 import sqlite3
@@ -7,23 +8,23 @@ import xml.etree.ElementTree as ET
 from html import escape
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
-
+ 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 log = logging.getLogger(__name__)
-
+ 
 TELEGRAM_TOKEN   = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 CET = ZoneInfo("Europe/Oslo")
-
+ 
 # ── Filters ───────────────────────────────────────────────────────────────────
 MIN_TRANSACTION_VALUE     = 100_000
 INCLUDE_TRANSACTION_CODES = {"P"}
 WATCHLIST_EXPIRY_DAYS     = 30
-
+ 
 # ── Catalyst scanner ──────────────────────────────────────────────────────────
 # SIC codes for pharma / biotech / medtech — only these sectors get 8-K scanned
 BIOTECH_SICS = {
@@ -34,10 +35,10 @@ BIOTECH_SICS = {
     "8011", "8049", "8071", "8099",          # health services
     "8731",                                  # commercial physical research
 }
-
+ 
 # 8-K item numbers that indicate regulatory/corporate events worth scanning
 CATALYST_ITEMS = {"8.01", "7.01"}
-
+ 
 # FDA keyword patterns — phrases only, no ambiguous abbreviations
 # Each tuple: (search_phrase, display_label)
 FDA_KEYWORDS = [
@@ -72,10 +73,10 @@ FDA_KEYWORDS = [
     ("fda issued",                   "FDA issued"),
     ("advisory committee",           "AdCom"),
 ]
-
+ 
 # Insider buy lookback for standalone catalyst alerts (days)
 CATALYST_INSIDER_LOOKBACK = 90
-
+ 
 # ── Signal thresholds ─────────────────────────────────────────────────────────
 RSI_PERIOD          = 14
 EMA_PERIOD          = 20
@@ -94,31 +95,31 @@ FUND_KEYWORDS       = {         # skip self-purchases by funds/ETFs
     "capital", "asset", "partners", "investments", "advisors",
     "group", "global", "corp.", "s.a.", "limited",
 }
-
+ 
 # ── EDGAR ─────────────────────────────────────────────────────────────────────
 EDGAR_HEADERS = {"User-Agent": "VMc1Investments scanner@vmc1.no"}
 EFTS_URL      = "https://efts.sec.gov/LATEST/search-index"
-
+ 
 # ── Database ──────────────────────────────────────────────────────────────────
 DB_PATH = "/data/watchlist.db"
-
+ 
 # ── Paperclip VMc1 ────────────────────────────────────────────────────────────
 PAPERCLIP_BASE_URL = os.environ.get("PAPERCLIP_BASE_URL", "")
 PAPERCLIP_CEO_API_KEY = os.environ.get("PAPERCLIP_CEO_API_KEY", "")
 VMC1_COMPANY_ID    = "dc2df96a-a846-4634-a9a0-24e593916c75"
 VMC1_CEO_AGENT_ID  = "3db60f1f-86fd-461e-a7bd-96392fa2c893"
-
-
+ 
+ 
 # ═══════════════════════════════════════════════════════════════════════════════
 # DATABASE
 # ═══════════════════════════════════════════════════════════════════════════════
-
+ 
 def db_connect() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
-
-
+ 
+ 
 def db_init():
     with db_connect() as conn:
         conn.execute("""
@@ -158,8 +159,8 @@ def db_init():
             )
         """)
     log.info("DB initialised")
-
-
+ 
+ 
 def db_add_ticker(t: dict):
     expires = (datetime.now(CET) + timedelta(days=WATCHLIST_EXPIRY_DAYS)).strftime("%Y-%m-%d")
     try:
@@ -180,8 +181,8 @@ def db_add_ticker(t: dict):
             ))
     except Exception as e:
         log.warning(f"DB insert failed for {t['ticker']}: {e}")
-
-
+ 
+ 
 def db_get_active() -> list:
     today = datetime.now(CET).strftime("%Y-%m-%d")
     with db_connect() as conn:
@@ -191,13 +192,13 @@ def db_get_active() -> list:
             ORDER BY value DESC
         """, (today,)).fetchall()
     return [dict(r) for r in rows]
-
-
+ 
+ 
 def db_mark_alerted(row_id: int):
     with db_connect() as conn:
         conn.execute("UPDATE watchlist SET alerted = 1 WHERE id = ?", (row_id,))
-
-
+ 
+ 
 def db_expire_old():
     today = datetime.now(CET).strftime("%Y-%m-%d")
     with db_connect() as conn:
@@ -206,15 +207,15 @@ def db_expire_old():
         ).rowcount
     if n:
         log.info(f"Expired {n} watchlist entries")
-
-
+ 
+ 
 def db_watchlist_count() -> int:
     with db_connect() as conn:
         return conn.execute(
             "SELECT COUNT(*) FROM watchlist WHERE alerted = 0"
         ).fetchone()[0]
-
-
+ 
+ 
 def db_get_recently_added(minutes: int = 30) -> list:
     """Return watchlist rows added within the last N minutes — for spot checks."""
     cutoff = (datetime.now(CET) - timedelta(minutes=minutes)).isoformat()
@@ -225,8 +226,8 @@ def db_get_recently_added(minutes: int = 30) -> list:
             ORDER BY value DESC
         """, (cutoff,)).fetchall()
     return [dict(r) for r in rows]
-
-
+ 
+ 
 def db_get_conviction_score(ticker: str) -> int:
     """Count distinct insider buy events for this ticker in the watchlist."""
     with db_connect() as conn:
@@ -234,13 +235,13 @@ def db_get_conviction_score(ticker: str) -> int:
             "SELECT COUNT(*) FROM watchlist WHERE ticker = ? AND alerted = 0",
             (ticker,)
         ).fetchone()[0]
-
-
+ 
+ 
 def db_get_ticker_history(ticker: str, lookback_days: int = WATCHLIST_EXPIRY_DAYS) -> dict:
     """
     Aggregate insider buy history for a ticker within the lookback window,
     regardless of whether individual rows have already been alerted.
-
+ 
     This reflects the INSIDER'S sustained buying behaviour over time —
     not just which rows happen to be unalerted on tonight's run.
     Used for conviction tier / Elite determination.
@@ -260,12 +261,12 @@ def db_get_ticker_history(ticker: str, lookback_days: int = WATCHLIST_EXPIRY_DAY
         "total_value": row["total_value"] or 0,
         "has_dir":     bool(row["has_dir"]),
     }
-
-
+ 
+ 
 # ═══════════════════════════════════════════════════════════════════════════════
 # TELEGRAM
 # ═══════════════════════════════════════════════════════════════════════════════
-
+ 
 def send_telegram(text: str) -> bool:
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     for attempt in range(3):
@@ -283,12 +284,12 @@ def send_telegram(text: str) -> bool:
             time.sleep(3)
     log.error("Telegram failed after 3 attempts")
     return False
-
-
+ 
+ 
 # ═══════════════════════════════════════════════════════════════════════════════
 # PAPERCLIP VMc1 INTEGRATION
 # ═══════════════════════════════════════════════════════════════════════════════
-
+ 
 def notify_paperclip_ceo(ticker: str, signals: list[tuple], market_data: dict) -> bool:
     """
     Create ONE task per ticker per run, consolidating all watchlist entries.
@@ -297,17 +298,17 @@ def notify_paperclip_ceo(ticker: str, signals: list[tuple], market_data: dict) -
     if not PAPERCLIP_BASE_URL or not PAPERCLIP_CEO_API_KEY:
         log.warning("Paperclip env vars not set — skipping CEO notification")
         return False
-
+ 
     # Use the highest-value row as the primary signal
     row, sig = max(signals, key=lambda x: x[0]["value"])
-
+ 
     conviction      = len(signals)
     vol_ratio       = sig["volume"] / max(sig["avg_volume"], 1)
     upside_pct      = ((sig["price"] - row["buy_price"]) / row["buy_price"]) * 100
     days_since      = (datetime.now(CET) - datetime.fromisoformat(row["added_at"])).days
     is_micro_cap    = sig["avg_volume"] < MICRO_CAP_VOL_MAX
     avg_vol_k       = sig["avg_volume"] / 1000
-
+ 
     # Conviction label — 5 unique tiers
     agg_value  = sum(r["value"] for r, _ in signals)
     has_dir_pc = any(r.get("insider_role") == "DIR" for r, _ in signals)
@@ -332,7 +333,7 @@ def notify_paperclip_ceo(ticker: str, signals: list[tuple], market_data: dict) -
         conviction_label = "🔵 STANDARD T2 — single INS buy, vol confirmed"
         strategy_note   = "Single insider buy with volume confirmation."
         position_size   = 100
-
+ 
     # Micro-cap flag
     micro_cap_note = ""
     if is_micro_cap:
@@ -347,30 +348,30 @@ Average daily volume is {avg_vol_k:.0f}k shares (below {MICRO_CAP_VOL_MAX/1000:.
 - **Do NOT average down** if price returns to insider level
 - Research Agent: verify avg daily dollar volume and check for pump-and-dump indicators
 """
-
+ 
     # All buy events for this ticker
     buy_events = "\n".join([
         f"  - {r['insider_name']} [{r['insider_role']}]: "
         f"{r['shares']:,.0f} sh @ ${r['buy_price']:.2f} = ${r['value']:,.0f} on {r['txn_date']}"
         for r, _ in sorted(signals, key=lambda x: x[0]["txn_date"] or "")
     ])
-
+ 
     task_title = f"[INSIDER SIGNAL] ${ticker} — {conviction_label} | ${position_size} position"
-
+ 
     task_body = f"""## VMc1 Insider Flow Signal — Action Required
-
+ 
 **Ticker:** ${ticker}
 **Company:** {row['company']}
 **Signal Date:** {datetime.now(CET).strftime('%Y-%m-%d')}
 **Conviction:** {conviction_label}
-
+ 
 ---
-
+ 
 ### All Insider Buy Events ({conviction} total)
 {buy_events}
-
+ 
 ---
-
+ 
 ### Technical Confirmations (4/4) ✅
 - Price ${sig['price']:.2f} > Highest insider buy ${row['buy_price']:.2f} ({upside_pct:+.1f}%) ✅
 - RSI {sig['rsi']} in range {RSI_MIN}–{RSI_MAX} ✅
@@ -380,25 +381,25 @@ Average daily volume is {avg_vol_k:.0f}k shares (below {MICRO_CAP_VOL_MAX/1000:.
 - Signal fired {days_since}d after first filing
 {micro_cap_note}
 ---
-
+ 
 ### Strategy Note
 {strategy_note}
-
+ 
 ---
-
+ 
 ### Requested Actions
-
+ 
 1. **Research Agent** — Pull fundamentals, recent news, sector context, insider history for ${ticker}. Score conviction (1–10). Flag any red flags (dilution, debt, litigation).
-
+ 
 2. **Backtest Agent** — Run insider-buy + 4-confirmation strategy on ${ticker} historically. Report win rate, avg return, max drawdown.
-
+ 
 3. **Risk Management Agent** — Suggested position: **${position_size}** based on conviction tier. {'$100 max for micro-cap momentum — override conviction sizing.' if is_micro_cap else ''} Stop = below ${row['buy_price']:.2f} (insider buy price). Target = 3:1 R:R. Approve or reject.
-
+ 
 4. **Execution Agent** — If Risk approves, place paper trade on Alpaca. Report entry, stop, target, size.
-
+ 
 This is a paper trade — no real capital at risk.
 """
-
+ 
     url     = f"{PAPERCLIP_BASE_URL}/api/companies/{VMC1_COMPANY_ID}/issues"
     headers = {
         "Authorization": f"Bearer {PAPERCLIP_CEO_API_KEY}",
@@ -411,30 +412,30 @@ This is a paper trade — no real capital at risk.
         "priority":    "urgent",
         "status":      "todo",
     }
-
+ 
     try:
         r = requests.post(url, json=payload, headers=headers, timeout=15)
         r.raise_for_status()
         issue    = r.json()
         issue_id = issue.get("issuePrefix", "VMC") + "-" + str(issue.get("number", "?"))
         log.info(f"Paperclip task created: {issue_id} for ${ticker} (conviction={conviction})")
-
+ 
         # Wake the CEO
         wake_url = (f"{PAPERCLIP_BASE_URL}/api/companies/{VMC1_COMPANY_ID}"
                     f"/agents/{VMC1_CEO_AGENT_ID}/heartbeat")
         requests.post(wake_url, headers=headers, timeout=10)
         log.info("CEO agent heartbeat triggered")
         return True
-
+ 
     except Exception as e:
         log.error(f"Paperclip notification failed for ${ticker}: {e}")
         return False
-
-
+ 
+ 
 # ═══════════════════════════════════════════════════════════════════════════════
 # MARKET DATA
 # ═══════════════════════════════════════════════════════════════════════════════
-
+ 
 def fetch_market_data(ticker: str) -> dict | None:
     try:
         import yfinance as yf
@@ -443,18 +444,18 @@ def fetch_market_data(ticker: str) -> dict | None:
         hist      = tk.history(period="60d", interval="1d", auto_adjust=True)
         if hist.empty or len(hist) < EMA_PERIOD + 1:
             return None
-
+ 
         closes  = hist["Close"].tolist()
         volumes = hist["Volume"].tolist()
         price   = closes[-1]
         volume  = volumes[-1]
-
+ 
         # 20-day EMA
         ema = closes[0]
         k   = 2 / (EMA_PERIOD + 1)
         for c in closes[1:]:
             ema = c * k + ema * (1 - k)
-
+ 
         # RSI-14
         gains, losses = [], []
         for i in range(1, RSI_PERIOD + 1):
@@ -463,16 +464,16 @@ def fetch_market_data(ticker: str) -> dict | None:
         avg_gain = sum(gains) / RSI_PERIOD if gains else 0
         avg_loss = sum(losses) / RSI_PERIOD if losses else 1e-9
         rsi      = 100 - (100 / (1 + avg_gain / avg_loss))
-
+ 
         avg_vol = sum(volumes[-EMA_PERIOD:]) / EMA_PERIOD
-
+ 
         return {"price": price, "rsi": rsi, "ema20": ema,
                 "volume": volume, "avg_volume": avg_vol}
     except Exception as e:
         log.debug(f"Market data failed for {ticker}: {e}")
         return None
-
-
+ 
+ 
 def check_signal(data: dict, insider_buy_price: float, conviction: int = 1,
                  is_director: bool = False, value: float = 0,
                  filed_date: str = "") -> dict:
@@ -480,7 +481,7 @@ def check_signal(data: dict, insider_buy_price: float, conviction: int = 1,
     already_moved = (data["price"] - insider_buy_price) / max(insider_buy_price, 0.01)
     filing_age    = get_filing_age_trading_days(filed_date)
     high_quality  = is_director or value >= MIN_INSIDER_QUALITY
-
+ 
     price_reclaim  = data["price"] > insider_buy_price
     close_to_entry = already_moved <= MAX_ABOVE_INSIDER
     ema_ok         = data["price"] > data["ema20"]
@@ -488,7 +489,7 @@ def check_signal(data: dict, insider_buy_price: float, conviction: int = 1,
     quality_ok     = high_quality
     sane_price     = insider_buy_price <= MAX_INSIDER_PRICE
     liquid         = data["avg_volume"] >= MIN_AVG_DAILY_VOL
-
+ 
     # CEO/large buy RSI override:
     # If Director AND total value >= $5M, waive RSI floor only
     # Insider conviction at this scale overrides short-term momentum weakness
@@ -497,10 +498,10 @@ def check_signal(data: dict, insider_buy_price: float, conviction: int = 1,
         rsi_ok = data["rsi"] <= RSI_MAX   # ceiling only — no floor
     else:
         rsi_ok = RSI_MIN <= data["rsi"] <= RSI_MAX
-
+ 
     # Volume confirmation: today's volume >= average daily volume
     volume_ok = data["volume"] >= data["avg_volume"]
-
+ 
     return {
         "signal":        all([price_reclaim, close_to_entry, rsi_ok, ema_ok,
                               fresh_filing, quality_ok, sane_price, liquid, volume_ok]),
@@ -523,12 +524,12 @@ def check_signal(data: dict, insider_buy_price: float, conviction: int = 1,
         "volume":        data["volume"],
         "avg_volume":    data["avg_volume"],
     }
-
-
+ 
+ 
 # ═══════════════════════════════════════════════════════════════════════════════
 # EDGAR SCAN
 # ═══════════════════════════════════════════════════════════════════════════════
-
+ 
 def fetch_all_filing_index(start_date: str, end_date: str) -> list[dict]:
     all_hits  = []
     offset    = 0
@@ -558,8 +559,8 @@ def fetch_all_filing_index(start_date: str, end_date: str) -> list[dict]:
             break
         time.sleep(0.35)
     return all_hits
-
-
+ 
+ 
 def parse_filing_meta(hit: dict):
     hit_id = hit.get("_id", "")
     src    = hit.get("_source", {})
@@ -573,8 +574,8 @@ def parse_filing_meta(hit: dict):
     ciks        = src.get("ciks", [])
     company_cik = ciks[-1].lstrip("0") if ciks else None
     return accession, company_cik, xml_filename, src
-
-
+ 
+ 
 def is_self_purchase(issuer_name: str, reporter_name: str) -> bool:
     """
     Returns True if the reporter appears to be a fund buying its own units
@@ -587,8 +588,8 @@ def is_self_purchase(issuer_name: str, reporter_name: str) -> bool:
     reporter_words = set(reporter_name.lower().split()) - FUND_KEYWORDS - {"the", "of", "and"}
     overlap = issuer_words & reporter_words
     return len(overlap) >= 2
-
-
+ 
+ 
 def is_stale_transaction(txn_date: str, max_days: int = MAX_TXN_AGE_DAYS) -> bool:
     """Returns True if the transaction date is older than max_days."""
     if not txn_date:
@@ -601,8 +602,8 @@ def is_stale_transaction(txn_date: str, max_days: int = MAX_TXN_AGE_DAYS) -> boo
         return age > max_days
     except Exception:
         return False
-
-
+ 
+ 
 def get_filing_age_trading_days(filed_date: str) -> int:
     """Approximate trading days since filing date, skipping weekends."""
     if not filed_date:
@@ -619,8 +620,8 @@ def get_filing_age_trading_days(filed_date: str) -> int:
         return days
     except Exception:
         return 999
-
-
+ 
+ 
 def parse_form4_xml(accession: str, company_cik: str,
                     xml_filename: str, src: dict) -> list[dict]:
     if not accession or not company_cik or not xml_filename:
@@ -638,11 +639,11 @@ def parse_form4_xml(accession: str, company_cik: str,
     except Exception as e:
         log.debug(f"XML fetch/parse failed {accession}: {e}")
         return []
-
+ 
     def txt(el, path):
         node = el.find(path)
         return node.text.strip() if node is not None and node.text else ""
-
+ 
     issuer_name    = txt(root, "issuer/issuerName")
     issuer_ticker  = txt(root, "issuer/issuerTradingSymbol")
     reporter_name  = txt(root, "reportingOwner/reportingOwnerId/rptOwnerName")
@@ -652,12 +653,12 @@ def parse_form4_xml(accession: str, company_cik: str,
     if not issuer_name:
         names = src.get("display_names", [])
         issuer_name = names[-1].split("  (CIK")[0] if names else ""
-
+ 
     # Skip fund self-purchases
     if is_self_purchase(issuer_name, reporter_name):
         log.debug(f"Skipping self-purchase: {reporter_name} buying {issuer_name}")
         return []
-
+ 
     results = []
     for txn in root.findall(".//nonDerivativeTransaction"):
         code = txt(txn, "transactionCoding/transactionCode")
@@ -698,18 +699,18 @@ def parse_form4_xml(accession: str, company_cik: str,
             "date":        txn_date_val,
         })
     return results
-
-
+ 
+ 
 # ═══════════════════════════════════════════════════════════════════════════════
 # CATALYST SCANNER  (8-K regulatory events + insider cross-reference)
 # ═══════════════════════════════════════════════════════════════════════════════
-
+ 
 def fetch_8k_filings(start_date: str, end_date: str) -> list[dict]:
     """Fetch 8-K filings from biotech/pharma SIC codes only."""
     all_hits  = []
     offset    = 0
     total_exp = None
-
+ 
     while True:
         params = {
             "forms":     "8-K",
@@ -725,33 +726,33 @@ def fetch_8k_filings(start_date: str, end_date: str) -> list[dict]:
         except Exception as e:
             log.error(f"8-K EFTS request failed at offset {offset}: {e}")
             break
-
+ 
         hits_obj = data.get("hits", {})
         if total_exp is None:
             t         = hits_obj.get("total", {})
             total_exp = t.get("value", 0) if isinstance(t, dict) else int(t or 0)
             log.info(f"8-K total filings in range: {total_exp}")
-
+ 
         batch = hits_obj.get("hits", [])
         if not batch:
             break
-
+ 
         # Filter to biotech/pharma SIC codes before adding
         for hit in batch:
             src  = hit.get("_source", {})
             sics = src.get("sics", [])
             if any(s in BIOTECH_SICS for s in sics):
                 all_hits.append(hit)
-
+ 
         offset += len(batch)
         if offset >= total_exp or offset >= 10_000:
             break
         time.sleep(0.35)
-
+ 
     log.info(f"8-K filings in biotech/pharma SICs: {len(all_hits)}")
     return all_hits
-
-
+ 
+ 
 def fetch_8k_text(accession: str, company_cik: str, filename: str) -> str:
     """Fetch the text content of an 8-K document."""
     if not filename or not filename.lower().endswith(".htm"):
@@ -771,8 +772,8 @@ def fetch_8k_text(accession: str, company_cik: str, filename: str) -> str:
     except Exception as e:
         log.debug(f"8-K text fetch failed {accession}: {e}")
         return ""
-
-
+ 
+ 
 def detect_fda_event(text: str) -> tuple[bool, str]:
     """
     Check if 8-K text contains FDA regulatory phrases.
@@ -782,21 +783,21 @@ def detect_fda_event(text: str) -> tuple[bool, str]:
     """
     if not text:
         return False, ""
-
+ 
     text_lower = text.lower()
     found_labels = []
-
+ 
     for phrase, label in FDA_KEYWORDS:
         if phrase.lower() in text_lower:
             if label not in found_labels:
                 found_labels.append(label)
-
+ 
     if not found_labels:
         return False, ""
-
+ 
     return True, ", ".join(found_labels[:5])
-
-
+ 
+ 
 def get_insider_buys_for_cik(cik: str) -> list[dict]:
     """Check if we have recent insider buys for this CIK in the watchlist."""
     cutoff = (datetime.now(CET) - timedelta(days=CATALYST_INSIDER_LOOKBACK)).strftime("%Y-%m-%d")
@@ -810,8 +811,8 @@ def get_insider_buys_for_cik(cik: str) -> list[dict]:
     # We don't store CIK in watchlist — match by ticker lookup if needed
     # Return all recent buys for caller to cross-reference by ticker
     return [dict(r) for r in rows]
-
-
+ 
+ 
 def db_add_catalyst(ticker: str, company: str, cik: str,
                     event_desc: str, filed_date: str,
                     accession: str, has_insider: bool):
@@ -833,8 +834,8 @@ def db_add_catalyst(ticker: str, company: str, cik: str,
             ))
     except Exception as e:
         log.warning(f"Catalyst DB insert failed {ticker}: {e}")
-
-
+ 
+ 
 def run_catalyst_scan(label: str = "morning"):
     """
     Scan 8-K filings from biotech/pharma companies for FDA regulatory events.
@@ -844,16 +845,16 @@ def run_catalyst_scan(label: str = "morning"):
     if now.weekday() >= 5:
         log.info(f"Weekend — skipping catalyst scan")
         return
-
+ 
     log.info(f"=== Catalyst 8-K scan starting ({label}) ===")
     end_date   = now.strftime("%Y-%m-%d")
     start_date = (now - timedelta(days=1)).strftime("%Y-%m-%d")
-
+ 
     hits = fetch_8k_filings(start_date, end_date)
     if not hits:
         log.info("No biotech/pharma 8-K filings found")
         return
-
+ 
     # Get current insider watchlist tickers for cross-reference
     recent_insider_tickers = set()
     cutoff = (now - timedelta(days=CATALYST_INSIDER_LOOKBACK)).strftime("%Y-%m-%d")
@@ -862,11 +863,11 @@ def run_catalyst_scan(label: str = "morning"):
             "SELECT DISTINCT ticker FROM watchlist WHERE added_at >= ?", (cutoff,)
         ).fetchall()
     recent_insider_tickers = {r[0] for r in rows}
-
+ 
     fda_events      = []
     convergence     = []  # FDA event + insider buy overlap
     seen_accessions = set()
-
+ 
     for hit in hits:
         src       = hit.get("_source", {})
         hit_id    = hit.get("_id", "")
@@ -875,15 +876,15 @@ def run_catalyst_scan(label: str = "morning"):
         ciks      = src.get("ciks", [])
         company_cik = ciks[-1].lstrip("0") if ciks else ""
         items     = src.get("items", [])
-
+ 
         if accession in seen_accessions:
             continue
         seen_accessions.add(accession)
-
+ 
         # Quick filter: only process items 8.01 and 7.01
         if not any(item in CATALYST_ITEMS for item in items):
             continue
-
+ 
         # Get ticker from display_names
         display = src.get("display_names", [""])
         ticker  = ""
@@ -895,19 +896,19 @@ def run_catalyst_scan(label: str = "morning"):
             if match:
                 ticker = match.group(1)
             company = display[0].split("  (")[0] if "  (" in display[0] else display[0]
-
+ 
         # Fetch and check document text for FDA keywords
         text = fetch_8k_text(accession, company_cik, filename)
         is_fda, event_desc = detect_fda_event(text)
-
+ 
         if not is_fda:
             continue
-
+ 
         has_insider = ticker in recent_insider_tickers
         db_add_catalyst(ticker, company, company_cik,
                         event_desc, src.get("file_date", end_date),
                         accession, has_insider)
-
+ 
         entry = {
             "ticker":      ticker,
             "company":     company,
@@ -919,12 +920,12 @@ def run_catalyst_scan(label: str = "morning"):
         fda_events.append(entry)
         if has_insider:
             convergence.append(entry)
-
+ 
         time.sleep(0.15)
-
+ 
     log.info(f"FDA 8-K events found: {len(fda_events)} "
              f"({len(convergence)} with insider convergence)")
-
+ 
     # ── Send convergence alerts first (highest priority) ──────────────────────
     for e in convergence:
         # Get insider detail from watchlist
@@ -935,7 +936,7 @@ def run_catalyst_scan(label: str = "morning"):
                 "ORDER BY value DESC LIMIT 1",
                 (e["ticker"],)
             ).fetchone()
-
+ 
         insider_line = ""
         if ins_rows:
             ins = dict(ins_rows)
@@ -944,7 +945,7 @@ def run_catalyst_scan(label: str = "morning"):
                 f"  👤 {ins['insider_name']} [{ins['insider_role']}]\n"
                 f"  💰 {ins['value']:,.0f} shares @ ${ins['buy_price']:.2f} on {ins['txn_date']}"
             )
-
+ 
         msg = (
             f"🔬 <b>VMc1 CATALYST CONVERGENCE — ${e['ticker']}</b>\n"
             f"<i>{e['company']}</i>\n\n"
@@ -958,7 +959,7 @@ def run_catalyst_scan(label: str = "morning"):
         )
         send_telegram(msg)
         log.info(f"CONVERGENCE ALERT: ${e['ticker']} — {e['event_desc']}")
-
+ 
     # ── Send standalone FDA events digest ─────────────────────────────────────
     standalone = [e for e in fda_events if not e["has_insider"]]
     if standalone:
@@ -980,28 +981,28 @@ def run_catalyst_scan(label: str = "morning"):
         if len(msg) > 4000:
             msg = msg[:4000] + "\n\n<i>... truncated — too many near signals</i>"
         send_telegram(msg)
-
+ 
     log.info(f"=== Catalyst scan complete ===")
-
-
+ 
+ 
 # ═══════════════════════════════════════════════════════════════════════════════
 # SCAN JOBS  (06:00 and 17:00 CET)
 # ═══════════════════════════════════════════════════════════════════════════════
-
+ 
 def run_scan(label: str = "morning"):
     now = datetime.now(CET)
     if now.weekday() >= 5:
         log.info(f"Weekend — skipping {label} scan ({now.strftime('%A')})")
         return
-
+ 
     log.info(f"=== SEC Form 4 {label} scan starting ===")
     end_date   = now.strftime("%Y-%m-%d")
     start_date = (now - timedelta(days=1)).strftime("%Y-%m-%d")
     log.info(f"Date range: {start_date} → {end_date}")
-
+ 
     raw_hits = fetch_all_filing_index(start_date, end_date)
     log.info(f"Found {len(raw_hits)} Form 4 filings to inspect")
-
+ 
     if not raw_hits:
         if label == "morning":
             send_telegram(
@@ -1009,10 +1010,10 @@ def run_scan(label: str = "morning"):
             )
         log.info(f"=== {label} scan complete ===")
         return
-
+ 
     qualifying      = []
     seen_accessions = set()
-
+ 
     for i, hit in enumerate(raw_hits):
         accession, company_cik, xml_filename, src = parse_filing_meta(hit)
         if not accession or accession in seen_accessions:
@@ -1026,10 +1027,10 @@ def run_scan(label: str = "morning"):
         if (i + 1) % 100 == 0:
             log.info(f"  Processed {i+1}/{len(raw_hits)}, qualifying: {len(qualifying)}")
         time.sleep(0.1)
-
+ 
     log.info(f"Qualifying purchases: {len(qualifying)}")
     qualifying.sort(key=lambda x: x["value"], reverse=True)
-
+ 
     new_additions = 0
     for t in qualifying:
         if t["ticker"] not in ("N/A", "NONE", "") and t["price"] > 0.10:
@@ -1038,13 +1039,13 @@ def run_scan(label: str = "morning"):
             after = db_watchlist_count()
             if after > before:
                 new_additions += 1
-
+ 
     log.info(f"Added {new_additions} new tickers to watchlist")
-
+ 
     if not qualifying:
         log.info(f"=== {label} scan complete ===")
         return
-
+ 
     lines = [
         f"🔍 <b>SEC Form 4 — Insider Purchases</b> <i>({label})</i>",
         f"<i>{start_date} → {end_date}</i>",
@@ -1064,15 +1065,15 @@ def run_scan(label: str = "morning"):
         )
     if len(qualifying) > 15:
         lines.append(f"\n<i>… and {len(qualifying) - 15} more</i>")
-
+ 
     send_telegram("\n".join(lines))
     log.info(f"=== {label} scan complete ===")
-
-
+ 
+ 
 # ═══════════════════════════════════════════════════════════════════════════════
 # SPOT CHECK  (runs ~5 min after intraday scan, new tickers only)
 # ═══════════════════════════════════════════════════════════════════════════════
-
+ 
 def run_spot_check():
     """
     Check only tickers added in the last 30 minutes.
@@ -1082,26 +1083,26 @@ def run_spot_check():
     now = datetime.now(CET)
     if now.weekday() >= 5:
         return
-
+ 
     new_rows = db_get_recently_added(minutes=30)
     if not new_rows:
         log.info("Spot check: no new tickers to check")
         return
-
+ 
     log.info(f"=== Spot check: {len(new_rows)} newly added tickers ===")
-
+ 
     # Group by ticker
     by_ticker: dict[str, list] = {}
     for row in new_rows:
         by_ticker.setdefault(row["ticker"], []).append(row)
-
+ 
     signals_by_ticker: dict[str, list[tuple]] = {}
-
+ 
     for ticker, rows in by_ticker.items():
         data = fetch_market_data(ticker)
         if not data:
             continue
-
+ 
         total_value = sum(r["value"] for r in rows)
         ticker_signals = []
         for row in rows:
@@ -1110,27 +1111,30 @@ def run_spot_check():
                                           is_director=(row["insider_role"] == "DIR"),
                                           value=total_value,
                                           filed_date=row["filed_date"])
+            # See note in run_watchlist_check() — now includes volume_ok,
+            # matching all 9 checks in check_signal()'s `signal` field.
             confirmations = sum([sig["price_reclaim"], sig["close_to_entry"],
                                  sig["rsi_ok"], sig["ema_ok"], sig["fresh_filing"],
-                                 sig["quality_ok"], sig["sane_price"], sig["liquid"]])
+                                 sig["quality_ok"], sig["sane_price"], sig["liquid"],
+                                 sig["volume_ok"]])
             log.info(
                 f"  [spot] {ticker}: price={data['price']:.2f} "
                 f"insider={row['buy_price']:.2f} RSI={sig['rsi']}{'*' if sig.get('ceo_large_buy') else ''} "
                 f"moved={sig['already_moved']*100:.1f}% age={sig['filing_age']}d "
-                f"confirms={confirmations}/8"
+                f"confirms={confirmations}/9"
             )
             if sig["signal"]:
                 ticker_signals.append((row, sig))
                 db_mark_alerted(row["id"])
-
+ 
         if ticker_signals:
             signals_by_ticker[ticker] = ticker_signals
         time.sleep(0.3)
-
+ 
     if not signals_by_ticker:
         log.info("Spot check: no signals fired")
         return
-
+ 
     # Send alerts — same format as full watchlist check
     for ticker, ticker_signals in signals_by_ticker.items():
         row, sig   = max(ticker_signals, key=lambda x: x[0]["value"])
@@ -1138,11 +1142,11 @@ def run_spot_check():
         conviction = history["event_count"]
         agg_value  = history["total_value"]
         has_dir    = history["has_dir"]
-
+ 
         vol_ratio  = sig["volume"] / max(sig["avg_volume"], 1)
         upside_pct = ((sig["price"] - row["buy_price"]) / row["buy_price"]) * 100
         is_micro   = sig["avg_volume"] < MICRO_CAP_VOL_MAX
-
+ 
         is_elite = conviction >= 3 and agg_value >= 1_000_000 and has_dir
         if is_elite:
             badge = "💎 ELITE"
@@ -1154,12 +1158,12 @@ def run_spot_check():
             badge = "🔺 STANDARD T1"
         else:
             badge = "🔵 STANDARD T2"
-
+ 
         if is_micro:
             micro_note = "\n  ⚠️ <b>MICRO-CAP MOMENTUM</b> — max $100, exit within 5 days"
         else:
             micro_note = ""
-
+ 
         # Trade levels
         entry     = sig["price"]
         stop      = round(row["buy_price"] * 0.98, 2)
@@ -1167,7 +1171,7 @@ def run_spot_check():
         t1        = round(entry + risk * 1.5, 2)
         t2        = round(entry + risk * 3.0, 2)
         t3        = round(entry + risk * 5.0, 2)
-
+ 
         if badge in ("💎 ELITE", "🔥 HIGH"):
             pos_size = 200
         elif badge == "🟠 ELEVATED":
@@ -1179,7 +1183,7 @@ def run_spot_check():
         if is_micro:
             pos_size = min(pos_size, 100)
         shares_to_buy = int(pos_size / entry) if entry > 0 else 0
-
+ 
         parts = [
             f"⚡ <b>VMc1 INTRADAY SIGNAL — ${ticker}</b>  {badge}",
             f"<i>{row['company']}</i>",
@@ -1212,7 +1216,7 @@ def run_spot_check():
         ]
         msg = "\n".join(parts)
         send_telegram(msg)
-
+ 
         # Only wake CEO agent for Elite signals
         if badge == "💎 ELITE":
             paperclip_ok = notify_paperclip_ceo(ticker, ticker_signals,
@@ -1220,75 +1224,83 @@ def run_spot_check():
             log.info(f"SPOT SIGNAL: ${ticker} {badge} | Paperclip: {'OK' if paperclip_ok else 'FAILED'}")
         else:
             log.info(f"SPOT SIGNAL: ${ticker} {badge} | Paperclip: skipped (not Elite)")
-
+ 
     log.info(f"=== Spot check complete: {len(signals_by_ticker)} signals fired ===")
-
-
+ 
+ 
 # ═══════════════════════════════════════════════════════════════════════════════
 # WATCHLIST SIGNAL CHECK  (21:00 CET daily)
 # ═══════════════════════════════════════════════════════════════════════════════
-
+ 
 def run_watchlist_check(label: str = "close"):
     now = datetime.now(CET)
     if now.weekday() >= 5:
         log.info(f"Weekend — skipping {label} watchlist check")
         return
-
+ 
     db_expire_old()
     active = db_get_active()
     log.info(f"=== Watchlist check [{label}]: {len(active)} active positions ===")
-
+ 
     if not active:
         log.info("Watchlist empty — nothing to check")
         return
-
+ 
     # Group rows by ticker first
     by_ticker: dict[str, list] = {}
     for row in active:
         by_ticker.setdefault(row["ticker"], []).append(row)
-
+ 
     signals_by_ticker: dict[str, list[tuple]] = {}  # ticker → [(row, sig), ...]
     partial_by_ticker: dict[str, tuple]        = {}  # ticker → (best_row, best_sig, count)
-
+ 
     for ticker, rows in by_ticker.items():
         data = fetch_market_data(ticker)
         if not data:
             log.debug(f"No market data for {ticker}")
             continue
-
+ 
         total_value    = sum(r["value"] for r in rows)
         ticker_signals = []
         best_partial   = None
-
+ 
         for row in rows:
             sig           = check_signal(data, row["buy_price"],
                                           conviction=len(rows),
                                           is_director=(row["insider_role"] == "DIR"),
                                           value=total_value,
                                           filed_date=row["filed_date"])
+            # Full 9-item count — matches exactly the 9 booleans all()-ed
+            # together in check_signal()'s `signal` field. Previously this
+            # summed only 8 of 9 (omitted volume_ok) while the digest label
+            # read "/9" — a real mismatch, since the count could never reach
+            # its own labelled max. Note: confirmations can only reach 8 in
+            # THIS branch — a true 9/9 always routes to ticker_signals below
+            # instead, so 8 here means "missing exactly one of nine checks."
             confirmations = sum([sig["price_reclaim"], sig["close_to_entry"],
                                  sig["rsi_ok"], sig["ema_ok"], sig["fresh_filing"],
-                                 sig["quality_ok"], sig["sane_price"], sig["liquid"]])
+                                 sig["quality_ok"], sig["sane_price"], sig["liquid"],
+                                 sig["volume_ok"]])
             log.info(
                 f"  {ticker}: price={data['price']:.2f} insider={row['buy_price']:.2f} "
                 f"RSI={sig['rsi']} moved={sig['already_moved']*100:.1f}% "
-                f"age={sig['filing_age']}d confirms={confirmations}/8"
+                f"age={sig['filing_age']}d confirms={confirmations}/9"
             )
-
+ 
             if sig["signal"]:
                 ticker_signals.append((row, sig))
                 db_mark_alerted(row["id"])
             elif confirmations >= 6:
                 if best_partial is None or confirmations > best_partial[2]:
                     best_partial = (row, sig, confirmations)
-
+ 
         if ticker_signals:
             signals_by_ticker[ticker] = ticker_signals
         elif best_partial:
             partial_by_ticker[ticker] = best_partial
-
+ 
         time.sleep(0.3)
-
+ 
     # ── Full signals — one Telegram + one Paperclip task per ticker ───────────
     for ticker, ticker_signals in signals_by_ticker.items():
         row, sig    = max(ticker_signals, key=lambda x: x[0]["value"])
@@ -1298,13 +1310,13 @@ def run_watchlist_check(label: str = "close"):
         conviction  = history["event_count"]
         agg_value   = history["total_value"]
         has_dir     = history["has_dir"]
-
+ 
         vol_ratio   = sig["volume"] / max(sig["avg_volume"], 1)
         upside_pct  = ((sig["price"] - row["buy_price"]) / row["buy_price"]) * 100
         days_since  = (datetime.now(CET) -
                        datetime.fromisoformat(row["added_at"])).days
         is_micro    = sig["avg_volume"] < MICRO_CAP_VOL_MAX
-
+ 
         # Conviction badge — 5 unique tiers
         is_elite = conviction >= 3 and agg_value >= 1_000_000 and has_dir
         if is_elite:
@@ -1317,10 +1329,10 @@ def run_watchlist_check(label: str = "close"):
             badge = "🔺 STANDARD T1"
         else:
             badge = "🔵 STANDARD T2"
-
+ 
         micro_note = "\n  ⚠️ <b>MICRO-CAP MOMENTUM</b> — max $100, exit within 5 days" \
                      if is_micro else ""
-
+ 
         # Trade levels
         entry     = sig["price"]
         stop      = round(row["buy_price"] * 0.98, 2)
@@ -1328,7 +1340,7 @@ def run_watchlist_check(label: str = "close"):
         t1        = round(entry + risk * 1.5, 2)
         t2        = round(entry + risk * 3.0, 2)
         t3        = round(entry + risk * 5.0, 2)
-
+ 
         if badge in ("💎 ELITE", "🔥 HIGH"):
             pos_size = 200
         elif badge == "🟠 ELEVATED":
@@ -1340,7 +1352,7 @@ def run_watchlist_check(label: str = "close"):
         if is_micro:
             pos_size = min(pos_size, 100)
         shares_to_buy = int(pos_size / entry) if entry > 0 else 0
-
+ 
         lines = [
             f"🚨 <b>VMc1 BUY SIGNAL — ${ticker}</b>  {badge}",
             f"<i>{row['company']}</i>",
@@ -1373,7 +1385,7 @@ def run_watchlist_check(label: str = "close"):
         ]
         msg = "\n".join(lines)
         send_telegram(msg)
-
+ 
         # Only wake CEO agent for Elite signals — controls Anthropic costs
         if badge == "💎 ELITE":
             paperclip_ok = notify_paperclip_ceo(ticker, ticker_signals,
@@ -1381,53 +1393,65 @@ def run_watchlist_check(label: str = "close"):
             log.info(f"SIGNAL FIRED: ${ticker} {badge} | Paperclip: {'OK' if paperclip_ok else 'FAILED'}")
         else:
             log.info(f"SIGNAL FIRED: ${ticker} {badge} | Paperclip: skipped (not Elite)")
-
-    # ── Partial signals digest ────────────────────────────────────────────────
+ 
+    # ── Partial signals digest — ELITE conviction + near-max technical only ──
     if partial_by_ticker:
-        lines = ["👀 <b>VMc1 Watchlist — Near Signals</b>", ""]
-        for ticker, (row, sig, n) in sorted(
-            partial_by_ticker.items(), key=lambda x: -x[1][2]
-        ):
-            vol_ratio  = sig["volume"] / max(sig["avg_volume"], 1)
-            moved_pct  = sig["already_moved"] * 100
-            sanity     = ""
-            if not sig["sane_price"]:
-                sanity += " ⚠️ price data error"
-            if not sig["liquid"]:
-                sanity += " ⚠️ illiquid"
-            if not sig["close_to_entry"]:
-                sanity += f" ⚠️ chasing (+{moved_pct:.0f}%)"
-            checks = (
-                f"{'✅' if sig['price_reclaim'] else '❌'} price "
-                f"{'✅' if sig['close_to_entry'] else '❌'} entry(+{sig['already_moved']*100:.0f}%) "
-                f"{'✅' if sig['rsi_ok'] else '❌'} RSI={sig['rsi']}{'*' if sig.get('ceo_large_buy') else ''} "
-                f"{'✅' if sig['ema_ok'] else '❌'} EMA "
-                f"{'✅' if sig['fresh_filing'] else '❌'} age={sig['filing_age']}d"
-            )
+        elite_entries = []
+        for ticker, (row, sig, n) in partial_by_ticker.items():
             history    = db_get_ticker_history(ticker)
             conviction = history["event_count"]
             agg_value  = history["total_value"]
             has_dir    = history["has_dir"]
-            conv_badge = " 💎" if (conviction >= 3 and agg_value >= 1_000_000 and has_dir) else " 🔥" if conviction >= 3 else " 🟠" if conviction == 2 else " 🔺" if (row["insider_role"] == "DIR" or row["value"] >= 1_000_000) else " 🔵"
-            safe_checks = checks.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
-            lines.append(
-                f"<b>${ticker}</b>{conv_badge} {n}/9\n"
-                f"  {safe_checks}\n"
-                f"  Price ${sig['price']:.2f} | Insider ${row['buy_price']:.2f} | "
-                f"Vol {vol_ratio:.1f}x | +{moved_pct:.1f}%"
-            )
-        send_telegram("\n".join(lines))
-
+ 
+            # Top insider-conviction tier: 3+ separate buy events,
+            # ≥$1M combined, at least one buyer was a Director.
+            conviction_tier_met = (conviction >= 3 and agg_value >= 1_000_000
+                                   and has_dir)
+            # Top technical tier reachable in this branch: n maxes at 8 here
+            # (see note above), so n >= 8 means "one check away from a full
+            # 9/9 BUY SIGNAL."
+            technical_tier_met  = n >= 8
+ 
+            if conviction_tier_met and technical_tier_met:
+                elite_entries.append((ticker, row, sig, n, conviction, agg_value))
+ 
+        if elite_entries:
+            lines = ["👀 <b>VMc1 Watchlist — Near Signals (💎 ELITE only)</b>", ""]
+            for ticker, row, sig, n, conviction, agg_value in sorted(
+                elite_entries, key=lambda x: (-x[3], -x[5])
+            ):
+                vol_ratio = sig["volume"] / max(sig["avg_volume"], 1)
+                moved_pct = sig["already_moved"] * 100
+                checks = (
+                    f"{'✅' if sig['price_reclaim'] else '❌'} price "
+                    f"{'✅' if sig['close_to_entry'] else '❌'} entry(+{sig['already_moved']*100:.0f}%) "
+                    f"{'✅' if sig['rsi_ok'] else '❌'} RSI={sig['rsi']}{'*' if sig.get('ceo_large_buy') else ''} "
+                    f"{'✅' if sig['ema_ok'] else '❌'} EMA "
+                    f"{'✅' if sig['fresh_filing'] else '❌'} age={sig['filing_age']}d "
+                    f"{'✅' if sig['volume_ok'] else '❌'} volume"
+                )
+                safe_checks = checks.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+                lines.append(
+                    f"<b>${ticker}</b> 💎 {n}/9  ({conviction} buys, ${agg_value:,.0f})\n"
+                    f"  {safe_checks}\n"
+                    f"  Price ${sig['price']:.2f} | Insider ${row['buy_price']:.2f} | "
+                    f"Vol {vol_ratio:.1f}x | +{moved_pct:.1f}%"
+                )
+            send_telegram("\n".join(lines))
+            log.info(f"Near Signals: {len(elite_entries)} ELITE-tier entries sent")
+        else:
+            log.info("Near Signals: no ELITE-tier entries tonight — digest suppressed")
+ 
     log.info(
         f"=== Watchlist check complete: {len(signals_by_ticker)} "
         f"tickers fired signals ==="
     )
-
-
+ 
+ 
 # ═══════════════════════════════════════════════════════════════════════════════
 # MAIN
 # ═══════════════════════════════════════════════════════════════════════════════
-
+ 
 # ── Schedule definition (all times in CET/CEST — DST handled automatically) ──
 # Each entry: (hour, minute, job_function, label)
 SCHEDULE = [
@@ -1439,8 +1463,8 @@ SCHEDULE = [
     (17, 15, lambda: run_catalyst_scan("intraday"),  "intraday catalyst"),
     (21, 0,  lambda: run_watchlist_check("close"),   "close watchlist"),
 ]
-
-
+ 
+ 
 def main():
     db_init()
     log.info("SEC Form 4 Scanner + Watchlist Monitor starting up")
@@ -1452,23 +1476,23 @@ def main():
         "📊 Watchlist checks: 15:00 pre-market + 21:00 close\n"
         "🕐 All times CET/CEST — DST aware"
     )
-
+ 
     log.info(
         "Scheduled (CET/CEST): scan 06:00+17:00 | catalyst 06:15+17:15 | "
         "watchlist 15:00+21:00 | spot 17:05"
     )
-
+ 
     log.info("Running initial scan now...")
     run_scan("startup")
-
+ 
     # Track which jobs have already run today to avoid double-firing
     last_run: dict[str, str] = {}  # label → date string
-
+ 
     while True:
         now  = datetime.now(CET)
         date = now.strftime("%Y-%m-%d")
         hm   = (now.hour, now.minute)
-
+ 
         for hour, minute, job, label in SCHEDULE:
             if hm == (hour, minute) and last_run.get(label) != date:
                 last_run[label] = date
@@ -1477,9 +1501,9 @@ def main():
                     job()
                 except Exception as e:
                     log.error(f"Job failed [{label}]: {e}", exc_info=True)
-
+ 
         time.sleep(30)
-
-
+ 
+ 
 if __name__ == "__main__":
     main()
