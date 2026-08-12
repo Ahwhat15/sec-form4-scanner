@@ -151,3 +151,16 @@ def get_logger(service_name: str = RAILWAY_SERVICE_NAME) -> OutcomeLogger:
     if _default_logger is None:
         _default_logger = OutcomeLogger(service_name)
     return _default_logger
+
+    def log_signal_sync(self, **kwargs):
+        """Sync wrapper for log_signal — works in both sync and async contexts."""
+        try:
+            loop = asyncio.get_running_loop()
+            # Already in async context — schedule as task
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor() as pool:
+                future = pool.submit(asyncio.run, self.log_signal(**kwargs))
+                return future.result(timeout=10)
+        except RuntimeError:
+            # No running loop — safe to use asyncio.run
+            return asyncio.run(self.log_signal(**kwargs))

@@ -3,6 +3,7 @@ import os
 import time
 import sqlite3
 import logging
+from outcome_logger import get_logger as _get_ol
 import requests
 import xml.etree.ElementTree as ET
 from html import escape
@@ -1216,6 +1217,17 @@ def run_spot_check():
         ]
         msg = "\n".join(parts)
         send_telegram(msg)
+        # ⚠️ CRITICAL: DO NOT REMOVE — feeds Hermes intelligence layer
+        try:
+            _get_ol().log_signal_sync(
+                symbol=ticker,
+                signal_type="sec_form4_insider_buy",
+                trade_taken=False,
+                score=float(len(ticker_signals)),
+                signal_detail={"badge": badge, "ticker": ticker},
+            )
+        except Exception as _e:
+            log.warning(f"Supabase log failed: {_e}")
  
         # Only wake CEO agent for Elite signals
         if badge == "💎 ELITE":
