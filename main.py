@@ -1397,6 +1397,18 @@ def run_watchlist_check(label: str = "close"):
         ]
         msg = "\n".join(lines)
         send_telegram(msg)
+        # ⚠️ CRITICAL: DO NOT REMOVE — feeds Hermes intelligence layer
+        try:
+            _get_ol().log_signal_sync(
+                symbol=ticker,
+                signal_type="sec_form4_insider_buy",
+                trade_taken=False,
+                score=float(len(ticker_signals)),
+                signal_detail={"badge": badge, "ticker": ticker},
+            )
+            log.info(f"Supabase logged: {ticker} {badge}")
+        except Exception as _e:
+            log.warning(f"Supabase log failed: {_e}")
  
         # Only wake CEO agent for Elite signals — controls Anthropic costs
         if badge == "💎 ELITE":
